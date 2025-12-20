@@ -100,7 +100,8 @@
           "rating",
           "reviewCount",
           "url",
-          "scrapedAt"
+          "scrapedAt",
+          "source"
         ]
       },
       "display": {

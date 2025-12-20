@@ -35,7 +35,8 @@ const STEALTHY_HEADERS = {
     'Cache-Control': 'max-age=0',
 };
 
-const ENABLE_BROWSER_FALLBACK = false;
+const ENABLE_BROWSER_FALLBACK = true;
+const PAGE_REQUEST_TIMEOUT_MS = 15000;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -192,6 +193,7 @@ const createStealthHeaders = () => ({
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Referer': DOMAIN_BASE,
+    'X-Requested-With': 'XMLHttpRequest',
 });
 
 const safeJsonParse = (maybeJson) => {
@@ -208,7 +210,10 @@ const extractEmbeddedState = (html) => {
     const patterns = [
         /window\.__APOLLO_STATE__\s*=\s*({.*?})\s*;?/s,
         /window\.__INITIAL_STATE__\s*=\s*({.*?})\s*;?/s,
+        /window\.__INITIAL_DATA__\s*=\s*({.*?})\s*;?/s,
+        /window\.__REDUX_STATE__\s*=\s*({.*?})\s*;?/s,
         /<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s,
+        /<script[^>]+id="__APOLLO_STATE__"[^>]*>(.*?)<\/script>/s,
         /<script[^>]+type="application\/json"[^>]*>(.*?)<\/script>/s,
     ];
 
@@ -322,6 +327,19 @@ const normalizeAgentFromJson = (rawAgent) => {
     return agent.url || agent.name ? agent : null;
 };
 
+const withPageParams = (url, page) => {
+    try {
+        const parsed = new URL(url);
+        const currentPage = Number.isFinite(page) ? page : parseInt(parsed.searchParams.get('page') || '1', 10) || 1;
+        parsed.searchParams.set('page', String(currentPage));
+        if (!parsed.searchParams.get('pageSize')) parsed.searchParams.set('pageSize', String(DEFAULT_PAGE_SIZE));
+        return parsed.toString();
+    } catch (err) {
+        log.debug(`Failed to apply page params: ${err.message}`);
+        return url;
+    }
+};
+
 const deriveNextPageUrl = ({ url, currentPage }) => {
     try {
         const parsed = new URL(url);
@@ -412,6 +430,10 @@ const createJsonApiCandidates = (url, page) => {
         const query = params.toString();
         candidates.add(`${DOMAIN_BASE}/real-estate-agents/api/search?${query}`);
         candidates.add(`${DOMAIN_BASE}/api/agents/search?${query}`);
+        candidates.add(`${DOMAIN_BASE}/real-estate-agents/api/list?${query}`);
+        candidates.add(`${DOMAIN_BASE}/rea/api/agents/search?${query}`);
+        candidates.add(`${DOMAIN_BASE}/rea/api/agents?${query}`);
+        candidates.add(`${DOMAIN_BASE}/api/agents?${query}`);
         candidates.add(`${DOMAIN_BASE}/agents/api/list?${query}`);
     } catch (err) {
         log.debug(`Failed to build API candidates: ${err.message}`);
@@ -421,7 +443,8 @@ const createJsonApiCandidates = (url, page) => {
 };
 
 const fetchAgentsViaJsonApi = async ({ url, page, proxyConfiguration }) => {
-    const apiCandidates = createJsonApiCandidates(url, page);
+    const pageUrl = withPageParams(url, page);
+    const apiCandidates = createJsonApiCandidates(pageUrl, page);
     for (const apiUrl of apiCandidates) {
         try {
             const response = await gotScraping({
@@ -433,7 +456,7 @@ const fetchAgentsViaJsonApi = async ({ url, page, proxyConfiguration }) => {
                     limit: 1,
                     statusCodes: [408, 429, 500, 502, 503, 504],
                 },
-                timeout: { request: 5000 },
+                timeout: { request: PAGE_REQUEST_TIMEOUT_MS },
             });
 
             const payload = safeJsonParse(response.body);
@@ -471,14 +494,27 @@ const addMetadata = (agent) => {
 const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, currentPage = 1 }) => {
     try {
         log.debug(`Scraping agent listing page: ${url}`);
+
+        // First try the JSON API route (fastest and cheapest)
+        if (!html) {
+            const apiResult = await fetchAgentsViaJsonApi({
+                url,
+                page: currentPage,
+                proxyConfiguration,
+            });
+            if (apiResult.agents.length > 0) {
+                return apiResult;
+            }
+        }
         
+        const targetUrl = withPageParams(url, currentPage);
         let pageHtml = html;
         
         if (!pageHtml) {
             const headers = createStealthHeaders();
 
             const response = await gotScraping({
-                url,
+                url: targetUrl,
                 headers,
                 proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
                 responseType: 'text',
@@ -486,7 +522,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                     limit: 2,
                     statusCodes: [408, 429, 500, 502, 503, 504],
                 },
-                timeout: { request: 12000 },
+                timeout: { request: PAGE_REQUEST_TIMEOUT_MS },
             });
 
             pageHtml = response.body;
@@ -514,7 +550,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
 
         // Validate we got HTML content
         if (pageHtml.includes('403 Forbidden') || pageHtml.length < 1000) {
-            log.warning('⚠️ Possible blocking or incomplete page received');
+            log.warning('Possible blocking or incomplete page received');
         }
 
         // Parse agent cards from HTML - multiple selector strategies
@@ -540,7 +576,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
         }
 
         if (agentCards.length === 0) {
-            log.warning('❌ No agent cards found with any selector strategy');
+            log.warning('No agent cards found with any selector strategy');
             log.debug(`Page HTML sample: ${pageHtml.substring(0, 500)}`);
         }
         
@@ -563,7 +599,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.url = ensureAbsoluteUrl(agentHref);
 
                 if (!isLikelyAgentUrl(agent.url)) {
-                    log.debug('⏭️  Skipping card: no valid agent URL found');
+                    log.debug('Skipping card: no valid agent URL found');
                     continue;
                 }
 
@@ -632,10 +668,10 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : null;
 
                 agents.push(addMetadata(agent));
-                log.debug(`✅ Extracted agent: ${agent.name} - ${agent.agency}`);
+                log.debug(`Extracted agent: ${agent.name} - ${agent.agency}`);
                 
             } catch (err) {
-                log.warning(`⚠️  Failed to parse agent card: ${err.message}`);
+                log.warning(`Failed to parse agent card: ${err.message}`);
             }
         }
 
@@ -647,7 +683,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
         const totalMatch = totalResultsText?.match(/([\d,]+)/);
         if (totalMatch) totalResults = totalResults || parseInt(totalMatch[1].replace(/,/g, ''), 10);
 
-        const nextPage = ensureAbsoluteUrl(nextPageCandidate || nextPageLink) || deriveNextPageUrl({ url, currentPage });
+        const nextPage = ensureAbsoluteUrl(nextPageCandidate || nextPageLink) || deriveNextPageUrl({ url: targetUrl, currentPage });
 
         return {
             agents,
@@ -669,7 +705,8 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
     let context;
     
     try {
-        log.debug(`Scraping via Playwright: ${url}`);
+        const targetUrl = withPageParams(url, currentPage);
+        log.debug(`Scraping via Playwright: ${targetUrl}`);
         
         const launchOptions = {
             headless: true,
@@ -697,7 +734,7 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         const page = await context.newPage();
         
         // Navigate to page
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
         
         // Wait for content to load
         try {
@@ -730,7 +767,7 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         await browser.close();
 
         // Parse with cheerio
-        return await scrapeAgentListingPage({ url, proxyConfiguration, html, currentPage });
+        return await scrapeAgentListingPage({ url: targetUrl, proxyConfiguration, html, currentPage });
     } catch (error) {
         log.error(`Playwright scraping failed: ${error.message}`);
         if (browser) {
@@ -973,6 +1010,7 @@ Actor.main(async () => {
         maxResults = 50,
         maxPages = 5,
         collectDetails = true,
+        maxConcurrency = 3,
         proxyConfiguration,
         location = null,
         suburb = null,
@@ -1000,10 +1038,10 @@ Actor.main(async () => {
     );
     
     if (!startUrl.includes('domain.com.au')) {
-        throw new Error('❌ Invalid input: startUrl must be from domain.com.au');
+        throw new Error('Invalid input: startUrl must be from domain.com.au');
     }
 
-    log.info('✅ Domain.com.au Real Estate Agents Scraper started', { 
+    log.info('Domain.com.au Real Estate Agents Scraper started', { 
         startUrl, 
         maxResults: validatedMaxResults, 
         maxPages: pageLimit,
@@ -1040,7 +1078,8 @@ Actor.main(async () => {
         searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
     }
 
-    log.info(`🔍 Final search URL: ${searchUrl}`);
+    searchUrl = withPageParams(searchUrl, 1);
+    log.info(`Final search URL: ${searchUrl}`);
 
     const allAgents = [];
     const seenIds = new Set();
@@ -1048,7 +1087,7 @@ Actor.main(async () => {
     let nextPageUrl = searchUrl;
     let totalResultsCount = null;
     const datasetPusher = createDatasetPusher(DATASET_BATCH_SIZE);
-    const maxDetailConcurrency = 3;
+    const maxDetailConcurrency = Math.max(1, Math.min(maxConcurrency || 3, 10));
     const detailLimiter = collectDetails ? createConcurrencyLimiter(maxDetailConcurrency) : null;
     const detailTasks = [];
     let detailsCollected = 0;
@@ -1056,7 +1095,7 @@ Actor.main(async () => {
     // Scraping loop
     while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
         log.info(
-            `📄 Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`,
+            `Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`,
             { url: nextPageUrl },
         );
 
@@ -1067,7 +1106,7 @@ Actor.main(async () => {
         });
 
         if ((!result || result.agents.length === 0) && ENABLE_BROWSER_FALLBACK) {
-            log.info(`🌐 Attempting Playwright fallback...`);
+            log.info('Attempting Playwright fallback...');
             result = await scrapeViaPlaywright({
                 url: nextPageUrl,
                 proxyConfiguration: proxyConfig,
@@ -1076,7 +1115,7 @@ Actor.main(async () => {
         }
 
         if (!result || result.agents.length === 0) {
-            log.warning(`❌ No agents found on page ${currentPage}, stopping pagination`);
+            log.warning(`No agents found on page ${currentPage}, stopping pagination`);
             break;
         }
 
@@ -1086,7 +1125,7 @@ Actor.main(async () => {
 
         if (result.totalResults && !totalResultsCount) {
             totalResultsCount = result.totalResults;
-            log.info(`📊 Total available: ${totalResultsCount} agents`);
+            log.info(`Total available: ${totalResultsCount} agents`);
         }
 
         // Deduplicate and add agents
@@ -1120,7 +1159,7 @@ Actor.main(async () => {
                             datasetPusher.enqueue({ ...addMetadata(normalized) });
                             await sleep(150 + Math.random() * 350);
                         } catch (error) {
-                            log.warning(`⚠️  Failed details for ${normalized.url}: ${error.message}`);
+                            log.warning(`Failed details for ${normalized.url}: ${error.message}`);
                             datasetPusher.enqueue({ ...addMetadata(normalized) });
                         }
                     }),
@@ -1130,7 +1169,7 @@ Actor.main(async () => {
             if (allAgents.length >= validatedMaxResults) break;
         }
 
-        log.info(`✅ Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`);
+        log.info(`Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`);
         if (!collectDetails && newItemsThisPage.length) {
             datasetPusher.enqueue(newItemsThisPage);
         }
@@ -1141,29 +1180,29 @@ Actor.main(async () => {
         // Rate limiting: human-like delays
         if (nextPageUrl && allAgents.length < validatedMaxResults) {
             const delay = 500 + Math.random() * 900;
-            log.debug(`⏳ Rate limiting: ${Math.round(delay)}ms before next page`);
+            log.debug(`Rate limiting: ${Math.round(delay)}ms before next page`);
             await sleep(delay);
         }
     }
 
     if (collectDetails && allAgents.length > 0) {
-        log.info(`📋 Collecting full details for ${allAgents.length} agents...`);
+        log.info(`Collecting full details for ${allAgents.length} agents...`);
         await Promise.all(detailTasks);
         await datasetPusher.flush();
-        log.info(`✅ Details collected for ${detailsCollected}/${allAgents.length} agents`);
+        log.info(`Details collected for ${detailsCollected}/${allAgents.length} agents`);
     } else {
         await datasetPusher.flush();
     }
 
     // Final report
-    log.info('═'.repeat(70));
-    log.info('✅ SCRAPING COMPLETED SUCCESSFULLY');
-    log.info('═'.repeat(70));
-    log.info(`📊 Agents scraped: ${allAgents.length}/${validatedMaxResults}`);
-    log.info(`📄 Pages processed: ${currentPage - 1}/${pageLimit}`);
-    log.info(`🎯 Details collected: ${collectDetails ? 'YES' : 'NO'}`);
-    log.info(`📈 Total available: ${totalResultsCount || 'Unknown'}`);
-    log.info('═'.repeat(70));
+    log.info('='.repeat(70));
+    log.info('SCRAPING COMPLETED SUCCESSFULLY');
+    log.info('='.repeat(70));
+    log.info(`Agents scraped: ${allAgents.length}/${validatedMaxResults}`);
+    log.info(`Pages processed: ${currentPage - 1}/${pageLimit}`);
+    log.info(`Details collected: ${collectDetails ? 'YES' : 'NO'}`);
+    log.info(`Total available: ${totalResultsCount || 'Unknown'}`);
+    log.info('='.repeat(70));
 });
 
 // ============================================================================

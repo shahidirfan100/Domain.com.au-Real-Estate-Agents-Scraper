@@ -75,6 +75,15 @@
       "editor": "number",
       "default": 3
     },
+    "maxConcurrency": {
+      "title": "Detail Concurrency",
+      "type": "integer",
+      "description": "Concurrent requests for detail collection (1-10). Higher values are faster but use more proxy bandwidth.",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "editor": "number"
+    },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",

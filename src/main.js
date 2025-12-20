@@ -1330,21 +1330,30 @@ Actor.main(async () => {
                     detailTasks.push(
                         detailLimiter(async () => {
                             try {
-                                if (!normalized.url || !isLikelyAgentUrl(normalized.url)) return;
-                                const details = await scrapeAgentDetails({
-                                    url: normalized.url,
-                                    sessionManager,
-                                });
+                                // Check if URL is valid for detail scraping
+                                // Accept URLs with /real-estate-agent/ pattern
+                                const hasValidUrl = normalized.url &&
+                                    (normalized.url.includes('/real-estate-agent/') ||
+                                        normalized.url.includes('/real-estate-agents/'));
 
-                                for (const [key, value] of Object.entries(details)) {
-                                    if (value && !normalized[key]) normalized[key] = value;
+                                if (hasValidUrl) {
+                                    const details = await scrapeAgentDetails({
+                                        url: normalized.url,
+                                        sessionManager,
+                                    });
+
+                                    for (const [key, value] of Object.entries(details)) {
+                                        if (value && !normalized[key]) normalized[key] = value;
+                                    }
+                                    detailsCollected++;
                                 }
 
-                                detailsCollected++;
+                                // ALWAYS push data to dataset
                                 datasetPusher.enqueue({ ...addMetadata(normalized) });
                                 await randomDelay(200, 500);
                             } catch (error) {
                                 log.warning(`Failed details for ${normalized.url}: ${error.message}`);
+                                // Still push data even on error
                                 datasetPusher.enqueue({ ...addMetadata(normalized) });
                             }
                         })

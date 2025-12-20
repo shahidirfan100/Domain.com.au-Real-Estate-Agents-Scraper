@@ -707,11 +707,17 @@ const addMetadata = (agent) => {
 // ============================================================================
 // MULTI-TIER EXTRACTION FROM HTML
 // ============================================================================
-
 /**
  * Extract agents from Apollo State (ContactSearchContact entries)
  * Based on actual page structure: __NEXT_DATA__.props.pageProps.__APOLLO_STATE__
  * Agent keys follow pattern: ContactSearchContact:<ID>
+ * 
+ * Field mappings based on inspection:
+ * - rating: reputation.overallStarRating
+ * - reviewCount: reputation.numberOfReviews
+ * - propertiesForSale: totalForSale
+ * - propertiesForRent: totalForRent
+ * - propertiesSold: totalSoldAndAuctioned
  */
 const extractAgentsFromApolloState = (apolloState) => {
     const agents = [];
@@ -719,6 +725,14 @@ const extractAgentsFromApolloState = (apolloState) => {
     if (!apolloState || typeof apolloState !== 'object') {
         return agents;
     }
+
+    // Helper to resolve Apollo State references (e.g., {"__ref": "Reputation:123"})
+    const resolveRef = (obj) => {
+        if (obj && obj.__ref && apolloState[obj.__ref]) {
+            return apolloState[obj.__ref];
+        }
+        return obj;
+    };
 
     // Find all ContactSearchContact entries
     const contactKeys = Object.keys(apolloState).filter(key =>
@@ -741,34 +755,45 @@ const extractAgentsFromApolloState = (apolloState) => {
                 ? ensureAbsoluteUrl(contact.profileUrl)
                 : (agentId ? `${DOMAIN_BASE}/real-estate-agent/${contact.name?.toLowerCase().replace(/\s+/g, '-')}-${agentId}/` : null);
 
+            // Resolve reputation reference if it exists
+            const reputation = resolveRef(contact.reputation) || {};
+
+            // Extract first name by splitting full name
+            let firstName = null;
+            if (contact.name) {
+                const nameParts = contact.name.trim().split(/\s+/);
+                firstName = nameParts[0] || null;
+            }
+
             const agent = {
                 id: agentId,
                 url: profileUrl,
                 name: contact.name || null,
-                firstName: contact.firstName || null,
-                lastName: contact.lastName || null,
+                firstName: firstName,
+                lastName: contact.name ? contact.name.replace(firstName, '').trim() || null : null,
                 title: contact.jobTitle || null,
                 agency: contact.agencyName || null,
                 agencyUrl: contact.agencyProfileUrl ? ensureAbsoluteUrl(contact.agencyProfileUrl) : null,
                 phone: contact.telephone || contact.phone || null,
                 mobile: contact.mobile || null,
-                email: contact.email || null,
+                email: contact.hasEmail ? 'Available (click to reveal)' : null,  // Email not exposed directly
+                hasEmail: contact.hasEmail || false,
                 suburb: contact.suburb || contact.location || null,
                 state: contact.state || null,
                 postcode: contact.postcode || null,
-                profileImage: contact.profilePhoto || contact.profilePhotoUrl || null,
+                profileImage: contact.profilePhoto || contact.profilePhotoUrl || contact.photo || null,
                 agencyLogo: contact.agencyLogoUrl || contact.agencyLogo || null,
-                biography: contact.biography || contact.bio || null,
-                // Performance metrics
+                biography: contact.biography || contact.bio || contact.profileText || null,
+                // Performance metrics - CORRECT FIELD NAMES
                 averageSoldPrice: contact.averageSoldPrice || null,
-                totalSoldAndAuctioned: contact.totalSoldAndAuctioned || null,
                 averageSoldDaysOnMarket: contact.averageSoldDaysOnMarket || null,
-                propertiesForSale: contact.propertiesForSale || null,
-                propertiesForRent: contact.propertiesForRent || null,
-                propertiesSold: contact.propertiesSold || null,
-                // Reviews
-                rating: contact.reputation?.starRating || contact.rating || null,
-                reviewCount: contact.reputation?.reviewCount || contact.reviewCount || null,
+                propertiesForSale: contact.totalForSale ?? contact.propertiesForSale ?? null,
+                propertiesForRent: contact.totalForRent ?? contact.propertiesForRent ?? null,
+                propertiesSold: contact.totalSoldAndAuctioned ?? contact.propertiesSold ?? null,
+                totalSoldAndAuctioned: contact.totalSoldAndAuctioned || null,
+                // Reviews - CORRECT FIELD NAMES from reputation object
+                rating: reputation.overallStarRating ?? reputation.starRating ?? contact.rating ?? null,
+                reviewCount: reputation.numberOfReviews ?? reputation.reviewCount ?? contact.reviewCount ?? null,
                 // Source
                 source: DOMAIN_BASE,
                 scrapedAt: new Date().toISOString(),
@@ -785,6 +810,7 @@ const extractAgentsFromApolloState = (apolloState) => {
 
     return agents;
 };
+
 
 const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
     let agents = [];
@@ -1090,19 +1116,65 @@ const scrapeAgentDetails = async ({ url, sessionManager }) => {
         const $ = cheerioLoad(html);
         const details = {};
 
+        // __NEXT_DATA__ extraction - Profile page has Contact object with more details
+        const nextData = extractNextData(html);
+        if (nextData?.props?.pageProps) {
+            const pageProps = nextData.props.pageProps;
+            const apolloState = pageProps.__APOLLO_STATE__;
+
+            if (apolloState) {
+                // Find the main Contact object (not ContactSearchContact)
+                const contactKey = Object.keys(apolloState).find(k =>
+                    k.startsWith('Contact:') && !k.includes('Search')
+                );
+
+                if (contactKey) {
+                    const contact = apolloState[contactKey];
+
+                    // Extract fields from profile page Contact object
+                    details.firstName = contact.firstName || null;
+                    details.biography = contact.profileText || contact.biography || null;
+                    details.phone = contact.telephone || contact.phone || null;
+                    details.mobile = contact.mobile || null;
+
+                    // Get full name if available
+                    if (contact.name && !details.firstName) {
+                        const nameParts = contact.name.trim().split(/\s+/);
+                        details.firstName = nameParts[0] || null;
+                    }
+
+                    // Check for listing stats in nested objects
+                    const listingsKey = Object.keys(apolloState).find(k =>
+                        k.includes('listingsByAgentIdV2')
+                    );
+                    if (listingsKey) {
+                        const listings = apolloState[listingsKey];
+                        if (listings) {
+                            details.propertiesForSale = listings.saleListings?.total ?? null;
+                            details.propertiesForRent = listings.leaseListings?.total ?? null;
+                            details.propertiesSold = listings.soldListings?.total ?? null;
+                        }
+                    }
+                }
+            }
+
+            // Fallback to agent in pageProps
+            if (pageProps.agent) {
+                const agentData = normalizeAgentFromJson(pageProps.agent);
+                if (agentData) {
+                    for (const [key, value] of Object.entries(agentData)) {
+                        if (value && !details[key]) details[key] = value;
+                    }
+                }
+            }
+        }
+
         // JSON-LD extraction
         const jsonLdData = extractJsonLd(html);
         const jsonLdAgent = parseJsonLdAgent(jsonLdData);
-        if (jsonLdAgent) Object.assign(details, jsonLdAgent);
-
-        // __NEXT_DATA__ extraction
-        const nextData = extractNextData(html);
-        if (nextData?.props?.pageProps?.agent) {
-            const agentData = normalizeAgentFromJson(nextData.props.pageProps.agent);
-            if (agentData) {
-                for (const [key, value] of Object.entries(agentData)) {
-                    if (value && !details[key]) details[key] = value;
-                }
+        if (jsonLdAgent) {
+            for (const [key, value] of Object.entries(jsonLdAgent)) {
+                if (value && !details[key]) details[key] = value;
             }
         }
 
@@ -1128,7 +1200,23 @@ const scrapeAgentDetails = async ({ url, sessionManager }) => {
             details.officeAddress = cleanText($('[data-testid="agent-address"], [class*="office-address"]').first().text());
         }
         if (!details.biography) {
-            details.biography = cleanText($('[data-testid="agent-bio"], [class*="biography"], [class*="about"]').first().text());
+            // Try multiple biography selectors
+            details.biography = cleanText(
+                $('[data-testid="agent-bio"], [class*="biography"], [class*="about-text"], [class*="profile-text"], .agent-bio, .about-section p').first().text()
+            );
+
+            // If still no biography, try to get all text from about section
+            if (!details.biography) {
+                const aboutSection = $('[class*="about"], [class*="bio"]').first();
+                if (aboutSection.length) {
+                    details.biography = cleanText(aboutSection.find('p').toArray().map(p => $(p).text()).join(' '));
+                }
+            }
+        }
+
+        // Clean up HTML from biography if present
+        if (details.biography && details.biography.includes('<')) {
+            details.biography = details.biography.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
         }
 
         return details;
@@ -1137,6 +1225,7 @@ const scrapeAgentDetails = async ({ url, sessionManager }) => {
         return {};
     }
 };
+
 
 // ============================================================================
 // HELPER: Concurrency Limiter & Dataset Pusher

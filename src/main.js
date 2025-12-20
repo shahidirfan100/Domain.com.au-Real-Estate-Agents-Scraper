@@ -306,26 +306,10 @@ class SessionManager {
                     : originalQuery(parameters);
         });
 
-        // Warm-up: Visit homepage first to establish session
-        log.info('Warming up session by visiting homepage...');
-        try {
-            await this.page.goto(DOMAIN_BASE, {
-                waitUntil: 'domcontentloaded',
-                timeout: NAVIGATION_TIMEOUT_MS,
-            });
-            await randomDelay(2000, 4000);
-
-            // Simulate human behavior
-            await this.simulateHumanBehavior();
-
-            // Store cookies
-            this.cookies = await this.context.cookies();
-            log.info(`Session established with ${this.cookies.length} cookies`);
-        } catch (error) {
-            log.warning(`Homepage warm-up failed: ${error.message}, continuing anyway...`);
-        }
-
+        // Skip homepage warm-up for faster initialization
+        // The stealth options are sufficient for Domain.com.au
         this.isInitialized = true;
+        log.info('Stealthy Firefox session initialized');
         return this;
     }
 

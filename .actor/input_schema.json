@@ -57,6 +57,13 @@
       "editor": "checkbox",
       "default": true
     },
+    "usePlaywright": {
+      "title": "Enable Playwright Fallback",
+      "type": "boolean",
+      "description": "Use Playwright when HTML/JSON parsing returns no agents. Slower and more expensive but more resilient.",
+      "editor": "checkbox",
+      "default": false
+    },
     "maxResults": {
       "title": "Maximum Agents",
       "type": "integer",

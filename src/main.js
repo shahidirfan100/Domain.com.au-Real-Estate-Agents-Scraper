@@ -36,7 +36,7 @@ const STEALTHY_HEADERS = {
     'Cache-Control': 'max-age=0',
 };
 
-const ENABLE_BROWSER_FALLBACK = true;
+const ENABLE_BROWSER_FALLBACK = false;
 const PAGE_REQUEST_TIMEOUT_MS = 25000;
 const PLAYWRIGHT_NAV_TIMEOUT_MS = 60000;
 
@@ -265,9 +265,15 @@ const isAgentLike = (obj) => {
             obj.firstName ||
             obj.lastName ||
             obj.name ||
+            obj.fullName ||
+            obj.displayName ||
             obj.email ||
             obj.phone ||
             obj.profileUrl ||
+            obj.profilePageUrl ||
+            obj.profilePageSlug ||
+            obj.profileSlug ||
+            obj.slug ||
             obj.agencyName
     );
 };
@@ -275,6 +281,7 @@ const isAgentLike = (obj) => {
 const locateAgentArray = (payload) => {
     const visited = new Set();
     const queue = [payload];
+    let best = [];
 
     while (queue.length) {
         const current = queue.shift();
@@ -286,7 +293,7 @@ const locateAgentArray = (payload) => {
 
         if (Array.isArray(current)) {
             const agentCandidates = current.filter(isAgentLike);
-            if (agentCandidates.length > 0) return agentCandidates;
+            if (agentCandidates.length > best.length) best = agentCandidates;
         }
 
         if (current && typeof current === 'object') {
@@ -298,7 +305,7 @@ const locateAgentArray = (payload) => {
         }
     }
 
-    return [];
+    return best;
 };
 
 const normalizeAgentFromJson = (rawAgent) => {
@@ -313,6 +320,10 @@ const normalizeAgentFromJson = (rawAgent) => {
     const urlCandidate =
         agentData.url ||
         agentData.profileUrl ||
+        agentData.profilePageUrl ||
+        agentData.profilePageSlug ||
+        agentData.profileSlug ||
+        agentData.slug ||
         agentData.canonicalUrl ||
         (agentData.agentSlug ? ensureAbsoluteUrl(agentData.agentSlug) : null);
     const normalizedUrl = ensureAbsoluteUrl(urlCandidate);
@@ -320,21 +331,21 @@ const normalizeAgentFromJson = (rawAgent) => {
     const agent = {
         id: String(agentData.id || agentData.agentId || agentData.profileId || '') || null,
         url: isLikelyAgentUrl(normalizedUrl) ? normalizedUrl : null,
-        name: agentData.name || agentData.agentName || 
+        name: agentData.name || agentData.fullName || agentData.displayName || agentData.agentName || 
               (agentData.firstName && agentData.lastName ? `${agentData.firstName} ${agentData.lastName}` : null),
-        firstName: agentData.firstName || null,
-        lastName: agentData.lastName || null,
-        title: agentData.title || agentData.jobTitle || agentData.position || null,
-        agency: agency.name || agentData.agencyName || null,
-        agencyUrl: ensureAbsoluteUrl(agency.url || agentData.agencyUrl) || null,
-        phone: contact.phone || agentData.phone || agentData.phoneNumber || null,
-        mobile: contact.mobile || agentData.mobile || agentData.mobileNumber || null,
-        email: contact.email || agentData.email || null,
+        firstName: agentData.firstName || agentData.givenName || null,
+        lastName: agentData.lastName || agentData.familyName || null,
+        title: agentData.title || agentData.jobTitle || agentData.position || agentData.role || null,
+        agency: agency.name || agentData.agencyName || agentData.officeName || null,
+        agencyUrl: ensureAbsoluteUrl(agency.url || agentData.agencyUrl || agentData.officeUrl) || null,
+        phone: contact.phone || contact.phoneNumber || agentData.phone || agentData.phoneNumber || null,
+        mobile: contact.mobile || contact.mobileNumber || agentData.mobile || agentData.mobileNumber || null,
+        email: contact.email || contact.emailAddress || agentData.email || null,
         officeAddress: contact.address || agency.address || agentData.officeAddress || null,
-        suburb: contact.suburb || agency.suburb || agentData.suburb || null,
-        state: contact.state || agency.state || agentData.state || null,
+        suburb: contact.suburb || agency.suburb || agentData.suburb || agentData.location?.suburb || null,
+        state: contact.state || agency.state || agentData.state || agentData.location?.state || null,
         postcode: contact.postcode || agency.postcode || agentData.postcode || null,
-        profileImage: agentData.profileImage || agentData.image || agentData.photo || null,
+        profileImage: agentData.profileImage || agentData.image || agentData.photo || agentData.photoUrl || agentData.avatar || null,
         agencyLogo: agency.logo || agentData.agencyLogo || null,
         biography: profile.biography || agentData.biography || agentData.bio || agentData.description || null,
         specializations: agentData.specializations || agentData.specialties || null,
@@ -1104,6 +1115,7 @@ Actor.main(async () => {
         maxResults = 50,
         maxPages = 5,
         collectDetails = true,
+        usePlaywright = false,
         maxConcurrency = 3,
         proxyConfiguration,
         location = null,
@@ -1197,6 +1209,7 @@ Actor.main(async () => {
     const detailLimiter = collectDetails ? createConcurrencyLimiter(maxDetailConcurrency) : null;
     const detailTasks = [];
     let detailsCollected = 0;
+    const enablePlaywright = Boolean(usePlaywright);
 
     // Scraping loop
     while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
@@ -1211,7 +1224,7 @@ Actor.main(async () => {
             currentPage,
         });
 
-        const needBrowser = ENABLE_BROWSER_FALLBACK && (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
+        const needBrowser = (ENABLE_BROWSER_FALLBACK || enablePlaywright) && (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
         if (needBrowser) {
             log.info('Attempting Playwright fallback...');
             result = await scrapeViaPlaywright({

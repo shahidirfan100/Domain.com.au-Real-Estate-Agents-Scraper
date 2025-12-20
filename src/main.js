@@ -1178,6 +1178,12 @@ Actor.main(async () => {
     }
 
     searchUrl = withPageParams(searchUrl, 1);
+    if (isRootAgentSearchUrl(searchUrl)) {
+        const fallbackSlug = DEFAULT_AGENT_LOCATION_FALLBACKS[0];
+        searchUrl = buildAgentLocationUrl(fallbackSlug);
+        log.warning(`Root search has no listings. Using default location: ${fallbackSlug}`);
+    }
+
     log.info(`Final search URL: ${searchUrl}`);
     let isRootSearch = isRootAgentSearchUrl(searchUrl);
 

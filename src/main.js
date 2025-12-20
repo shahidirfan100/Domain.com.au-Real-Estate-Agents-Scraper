@@ -708,42 +708,149 @@ const addMetadata = (agent) => {
 // MULTI-TIER EXTRACTION FROM HTML
 // ============================================================================
 
+/**
+ * Extract agents from Apollo State (ContactSearchContact entries)
+ * Based on actual page structure: __NEXT_DATA__.props.pageProps.__APOLLO_STATE__
+ * Agent keys follow pattern: ContactSearchContact:<ID>
+ */
+const extractAgentsFromApolloState = (apolloState) => {
+    const agents = [];
+
+    if (!apolloState || typeof apolloState !== 'object') {
+        return agents;
+    }
+
+    // Find all ContactSearchContact entries
+    const contactKeys = Object.keys(apolloState).filter(key =>
+        key.startsWith('ContactSearchContact:')
+    );
+
+    log.debug(`Found ${contactKeys.length} ContactSearchContact entries in Apollo state`);
+
+    for (const key of contactKeys) {
+        try {
+            const contact = apolloState[key];
+            if (!contact || typeof contact !== 'object') continue;
+
+            // Extract agent ID from key (e.g., "ContactSearchContact:1721099" -> "1721099")
+            const idMatch = key.match(/ContactSearchContact:(\d+)/);
+            const agentId = idMatch ? idMatch[1] : null;
+
+            // Build profile URL
+            const profileUrl = contact.profileUrl
+                ? ensureAbsoluteUrl(contact.profileUrl)
+                : (agentId ? `${DOMAIN_BASE}/real-estate-agent/${contact.name?.toLowerCase().replace(/\s+/g, '-')}-${agentId}/` : null);
+
+            const agent = {
+                id: agentId,
+                url: profileUrl,
+                name: contact.name || null,
+                firstName: contact.firstName || null,
+                lastName: contact.lastName || null,
+                title: contact.jobTitle || null,
+                agency: contact.agencyName || null,
+                agencyUrl: contact.agencyProfileUrl ? ensureAbsoluteUrl(contact.agencyProfileUrl) : null,
+                phone: contact.telephone || contact.phone || null,
+                mobile: contact.mobile || null,
+                email: contact.email || null,
+                suburb: contact.suburb || contact.location || null,
+                state: contact.state || null,
+                postcode: contact.postcode || null,
+                profileImage: contact.profilePhoto || contact.profilePhotoUrl || null,
+                agencyLogo: contact.agencyLogoUrl || contact.agencyLogo || null,
+                biography: contact.biography || contact.bio || null,
+                // Performance metrics
+                averageSoldPrice: contact.averageSoldPrice || null,
+                totalSoldAndAuctioned: contact.totalSoldAndAuctioned || null,
+                averageSoldDaysOnMarket: contact.averageSoldDaysOnMarket || null,
+                propertiesForSale: contact.propertiesForSale || null,
+                propertiesForRent: contact.propertiesForRent || null,
+                propertiesSold: contact.propertiesSold || null,
+                // Reviews
+                rating: contact.reputation?.starRating || contact.rating || null,
+                reviewCount: contact.reputation?.reviewCount || contact.reviewCount || null,
+                // Source
+                source: DOMAIN_BASE,
+                scrapedAt: new Date().toISOString(),
+            };
+
+            // Only add if we have valid data
+            if (agent.name || agent.url) {
+                agents.push(agent);
+            }
+        } catch (err) {
+            log.debug(`Failed to parse contact ${key}: ${err.message}`);
+        }
+    }
+
+    return agents;
+};
+
 const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
     let agents = [];
     let totalResults = null;
     let nextPage = null;
     let extractionMethod = 'none';
 
-    // Tier 1: __NEXT_DATA__
+    // Tier 1: __NEXT_DATA__ with __APOLLO_STATE__ (MOST RELIABLE)
     const nextData = extractNextData(html);
     if (nextData) {
         const pageProps = nextData.props?.pageProps;
-        if (pageProps) {
+
+        // Check for Apollo State inside NEXT_DATA
+        const apolloState = pageProps?.__APOLLO_STATE__;
+        if (apolloState) {
+            agents = extractAgentsFromApolloState(apolloState);
+            if (agents.length > 0) {
+                extractionMethod = '__APOLLO_STATE__';
+                log.info(`Extracted ${agents.length} agents from __APOLLO_STATE__`);
+
+                // Try to get pagination info from Apollo state
+                const paginationKey = Object.keys(apolloState).find(k =>
+                    k.includes('pagination') || k.includes('Pagination')
+                );
+                if (paginationKey) {
+                    const paginationData = apolloState[paginationKey];
+                    totalResults = paginationData?.totalResults || paginationData?.total || null;
+                }
+            }
+        }
+
+        // Fallback: Try to find agents array directly in pageProps
+        if (agents.length === 0 && pageProps) {
             const agentArray = locateAgentArray(pageProps);
             if (agentArray.length > 0) {
                 agents = agentArray
                     .map((item) => normalizeAgentFromJson(item))
                     .filter((item) => item && (item.url || item.name));
-                extractionMethod = '__NEXT_DATA__';
-                log.info(`Extracted ${agents.length} agents from __NEXT_DATA__`);
+                extractionMethod = '__NEXT_DATA__ (pageProps)';
+                log.info(`Extracted ${agents.length} agents from __NEXT_DATA__ pageProps`);
 
-                // Try to get pagination info
                 totalResults = pageProps.totalAgents || pageProps.total || pageProps.pagination?.total || null;
             }
         }
     }
 
-    // Tier 2: Apollo/Initial State
+    // Tier 2: Standalone Apollo/Initial State (window.__APOLLO_STATE__)
     if (agents.length === 0) {
         const apolloState = extractApolloState(html);
         if (apolloState) {
-            const agentArray = locateAgentArray(apolloState);
-            if (agentArray.length > 0) {
-                agents = agentArray
-                    .map((item) => normalizeAgentFromJson(item))
-                    .filter((item) => item && (item.url || item.name));
-                extractionMethod = 'Apollo State';
-                log.info(`Extracted ${agents.length} agents from Apollo State`);
+            agents = extractAgentsFromApolloState(apolloState);
+            if (agents.length > 0) {
+                extractionMethod = 'Apollo State (window)';
+                log.info(`Extracted ${agents.length} agents from window Apollo State`);
+            }
+
+            // Fallback to generic search
+            if (agents.length === 0) {
+                const agentArray = locateAgentArray(apolloState);
+                if (agentArray.length > 0) {
+                    agents = agentArray
+                        .map((item) => normalizeAgentFromJson(item))
+                        .filter((item) => item && (item.url || item.name));
+                    extractionMethod = 'Apollo State (generic)';
+                    log.info(`Extracted ${agents.length} agents from Apollo State (generic)`);
+                }
             }
         }
     }
@@ -761,7 +868,7 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
         }
     }
 
-    // Tier 4: HTML Parsing
+    // Tier 4: HTML Parsing (FALLBACK)
     if (agents.length === 0) {
         const htmlResult = parseAgentsFromHtml(html);
         agents = htmlResult.agents;
@@ -779,92 +886,152 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
     return { agents: agents.map(addMetadata), totalResults, nextPage, extractionMethod };
 };
 
+
 const parseAgentsFromHtml = (html) => {
     const $ = cheerioLoad(html);
     const agents = [];
     let totalResults = null;
 
-    // Multiple selector strategies
+    // Multiple selector strategies based on actual page inspection
     let agentCards = [];
 
-    // Strategy 1: data-testid patterns
-    agentCards = $(
-        '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], [data-testid*="agent-list-item"]'
-    ).toArray();
+    // Strategy 1: Find containers with profile links to /real-estate-agent/
+    // Based on inspection: cards contain <a href="/real-estate-agent/...">
+    const profileLinks = $('a[href^="/real-estate-agent/"]').toArray();
+    log.debug(`Found ${profileLinks.length} profile links`);
 
-    // Strategy 2: Class-based selectors
+    // Get parent containers for each profile link
+    const cardContainers = new Set();
+    for (const link of profileLinks) {
+        let container = $(link).parent();
+        // Go up until we find a container with meaningful content (h3, stats, etc.)
+        for (let i = 0; i < 5 && container.length; i++) {
+            if (container.find('h3').length > 0 || container.find('dl').length > 0) {
+                cardContainers.add(container[0]);
+                break;
+            }
+            container = container.parent();
+        }
+    }
+    agentCards = Array.from(cardContainers);
+    log.debug(`Found ${agentCards.length} agent card containers via profile links`);
+
+    // Strategy 2: Direct class selectors from inspection
     if (agentCards.length === 0) {
-        agentCards = $(
-            'article.agent-card, article[class*="agent"], div[class*="agent-card"], div[class*="agent-profile"], li[class*="agent"]'
-        ).toArray();
+        agentCards = $('div.css-14ap5d, div[class*="agent-card"]').toArray();
+        log.debug(`Found ${agentCards.length} agent cards via class selectors`);
     }
 
-    // Strategy 3: Generic patterns
+    // Strategy 3: data-testid patterns
     if (agentCards.length === 0) {
-        agentCards = $('article, li, div[class*="card"]')
-            .toArray()
-            .filter((el) => {
-                const text = $(el).text().toLowerCase();
-                return (text.includes('agent') || text.includes('agency')) && text.length < 2000;
-            });
+        agentCards = $(
+            '[data-testid*="agent-card"], [data-testid*="agent-tile"], [data-testid*="agent-list-item"]'
+        ).toArray();
+        log.debug(`Found ${agentCards.length} agent cards via data-testid`);
+    }
+
+    // Strategy 4: Class-based fallback
+    if (agentCards.length === 0) {
+        agentCards = $(
+            'article.agent-card, article[class*="agent"], div[class*="agent-profile"], li[class*="agent"]'
+        ).toArray();
+        log.debug(`Found ${agentCards.length} agent cards via article/class selectors`);
     }
 
     if (agentCards.length > MAX_CARD_PARSE) {
         agentCards = agentCards.slice(0, MAX_CARD_PARSE);
     }
 
+
     for (const card of agentCards) {
         try {
             const $card = $(card);
 
-            const hrefs = $card
-                .find('a[href]')
-                .map((_, el) => $(el).attr('href'))
-                .get();
-            const agentHref = pickAgentHref(hrefs);
-            const agentUrl = ensureAbsoluteUrl(agentHref);
+            // Find profile link - primary method for agent URL
+            const profileLink = $card.find('a[href^="/real-estate-agent/"]').first();
+            let agentUrl = profileLink.attr('href');
 
-            if (!isLikelyAgentUrl(agentUrl)) {
+            if (!agentUrl) {
+                const hrefs = $card
+                    .find('a[href]')
+                    .map((_, el) => $(el).attr('href'))
+                    .get();
+                agentUrl = pickAgentHref(hrefs);
+            }
+
+            agentUrl = ensureAbsoluteUrl(agentUrl);
+
+            if (!agentUrl || !agentUrl.includes('/real-estate-agent/')) {
                 continue;
             }
 
-            let nameText = cleanText(
-                $card.find('h3.css-1hakis5, [data-testid*="name"], [data-testid*="agent-name"], .agent-name, h2, h3, .title').first().text()
-            );
-            if (!nameText) nameText = cleanText($card.find('a').first().text());
-            if (!nameText || /find agents?/i.test(nameText)) continue;
+            // Extract agent name - h3 is the primary name element
+            let nameText = cleanText($card.find('h3').first().text());
+            if (!nameText) {
+                nameText = cleanText($card.find('h3.css-1hakis5').first().text());
+            }
+            if (!nameText) {
+                nameText = cleanText(profileLink.text());
+            }
+            if (!nameText || /find agents?/i.test(nameText) || /view profile/i.test(nameText)) continue;
+
+            // Extract job title (usually first p after h3)
+            const allParagraphs = $card.find('p').toArray();
+            let titleText = null;
+            let agencyText = null;
+
+            if (allParagraphs.length >= 1) {
+                titleText = cleanText($(allParagraphs[0]).text());
+            }
+            if (allParagraphs.length >= 2) {
+                agencyText = cleanText($(allParagraphs[1]).text());
+            }
+
+            // Extract stats from dl element
+            let avgSoldPrice = null;
+            let propertiesSold = null;
+            const statsContainer = $card.find('dl').first();
+            if (statsContainer.length) {
+                statsContainer.find('div').each((_, statDiv) => {
+                    const label = cleanText($(statDiv).find('dt').text())?.toLowerCase() || '';
+                    const value = cleanText($(statDiv).find('dd').text());
+
+                    if (label.includes('sold price') || label.includes('avg sold')) {
+                        avgSoldPrice = value;
+                    } else if (label.includes('properties sold') || label.includes('sold')) {
+                        propertiesSold = value;
+                    }
+                });
+            }
+
+            // Extract agent ID from URL
+            const idMatch = agentUrl.match(/-(\d{6,})\/?$/);
+            const agentId = idMatch ? idMatch[1] : null;
 
             const agent = {
-                id: null,
+                id: agentId,
                 url: agentUrl,
                 name: nameText,
-                title: cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text()),
-                agency: cleanText($card.find('[data-testid*="agency"], .agency-name, [class*="agency"], [class*="company"]').first().text()),
-                agencyUrl: ensureAbsoluteUrl($card.find('a[href*="agency"], a[href*="agencies"]').first().attr('href')) || null,
+                title: titleText,
+                agency: agencyText,
+                agencyUrl: ensureAbsoluteUrl($card.find('a[href*="/real-estate-agencies/"]').first().attr('href')) || null,
                 phone: extractPhoneNumber(
-                    $card.find('a[href^="tel:"], [data-testid*="phone"], .phone').first().text() ||
+                    $card.find('a[href^="tel:"], button[data-testid="cta-call-button"]').first().text() ||
                     $card.find('a[href^="tel:"]').attr('href') ||
                     ''
                 ),
                 email: extractEmail(
-                    $card.find('a[href^="mailto:"], [data-testid*="email"], .email').first().text() ||
+                    $card.find('a[href^="mailto:"], button[data-testid="contact__email-button"]').first().text() ||
                     $card.find('a[href^="mailto:"]').attr('href') ||
                     ''
                 ),
-                suburb: cleanText($card.find('[class*="suburb"], [class*="location"], [class*="address"]').first().text()),
-                profileImage: $card.find('img[data-testid*="agent"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
-                agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first().attr('src') || null,
-                currentListings: cleanText($card.find('[class*="listing"], [data-testid*="listing"]').first().text()),
-                soldProperties: cleanText($card.find('[class*="sold"], [data-testid*="sold"]').first().text()),
-                rating: cleanText(
-                    $card.find('[data-rating], .rating, .stars').first().attr('data-rating') || $card.find('.rating, .stars').first().text()
-                ),
+                profileImage: $card.find('img[data-testid="fe-co-avatar--image"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
+                agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"]').first().attr('src') || null,
+                averageSoldPrice: avgSoldPrice,
+                propertiesSold: propertiesSold,
                 source: DOMAIN_BASE,
                 scrapedAt: new Date().toISOString(),
             };
-
-            const idMatch = agent.url?.match(/(\d{6,})(?:[/?#]|$)/);
-            agent.id = idMatch ? idMatch[1] : null;
 
             agents.push(agent);
         } catch (err) {
@@ -872,13 +1039,26 @@ const parseAgentsFromHtml = (html) => {
         }
     }
 
-    // Extract pagination
-    let nextPageLink = $('a[aria-label="Go to next page"]').attr('href');
-    if (!nextPageLink) nextPageLink = $('a[rel="next"]').attr('href');
-    if (!nextPageLink) nextPageLink = $('a[aria-label*="Next"]').attr('href');
+    log.debug(`Parsed ${agents.length} agents from HTML cards`);
 
-    const totalResultsText = cleanText($('[data-testid*="total"], [class*="total-results"]').first().text());
-    const totalMatch = totalResultsText?.match(/([\d,]+)/);
+    // Extract pagination - based on inspection
+    let nextPageLink = $('a[href*="page="]').filter((_, el) => {
+        const text = $(el).text().toLowerCase();
+        return text.includes('next') || text === '›' || text === '»';
+    }).first().attr('href');
+
+    if (!nextPageLink) {
+        nextPageLink = $('nav[aria-label="pagination"] a').filter((_, el) => {
+            const text = $(el).text().toLowerCase();
+            return text.includes('next');
+        }).first().attr('href');
+    }
+    if (!nextPageLink) nextPageLink = $('a[aria-label="Go to next page"]').attr('href');
+    if (!nextPageLink) nextPageLink = $('a[rel="next"]').attr('href');
+
+    // Try to find total from page header (e.g., "1,234 real estate agents")
+    const headerText = $('h1').first().text();
+    const totalMatch = headerText?.match(/([\d,]+)\s*real estate agents?/i);
     if (totalMatch) totalResults = parseInt(totalMatch[1].replace(/,/g, ''), 10);
 
     return { agents, totalResults, nextPage: ensureAbsoluteUrl(nextPageLink) };

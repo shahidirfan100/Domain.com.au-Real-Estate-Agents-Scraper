@@ -1,6 +1,6 @@
 import { Actor, log } from 'apify';
 import { Dataset, gotScraping } from 'crawlee';
-import { chromium } from 'playwright';
+import { firefox } from 'playwright';
 import { load as cheerioLoad } from 'cheerio';
 
 // ============================================================================
@@ -10,11 +10,13 @@ import { load as cheerioLoad } from 'cheerio';
 const DOMAIN_BASE = 'https://www.domain.com.au';
 const DEFAULT_AGENT_LOCATION = 'perth-wa-6000';
 
+// Rotate through multiple realistic user agents
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:127.0) Gecko/20100101 Firefox/127.0',
 ];
 
 const STEALTHY_HEADERS = {
@@ -22,23 +24,21 @@ const STEALTHY_HEADERS = {
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'en-AU,en-US;q=0.9,en;q=0.8',
     DNT: '1',
-    Referer: DOMAIN_BASE,
-    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="121", "Google Chrome";v="121"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
     'Cache-Control': 'max-age=0',
+    Connection: 'keep-alive',
 };
 
-const ENABLE_BROWSER_FALLBACK = true;
+// Timings
+const PLAYWRIGHT_TIMEOUT_MS = 60000;
+const NAVIGATION_TIMEOUT_MS = 45000;
 const DEFAULT_PAGE_SIZE = 40;
 const MAX_CARD_PARSE = 160;
 const DATASET_BATCH_SIZE = 10;
-const PLAYWRIGHT_TIMEOUT_MS = 45000;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -47,6 +47,10 @@ const PLAYWRIGHT_TIMEOUT_MS = 45000;
 const getRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const randomDelay = (min = 500, max = 1500) => sleep(min + Math.random() * (max - min));
+
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
 const cleanText = (text) => {
     if (!text) return null;
@@ -130,8 +134,396 @@ const extractEmail = (text) => {
 };
 
 // ============================================================================
-// JSON-LD EXTRACTION
+// SESSION MANAGER - Handles Browser Session with Stealth & Cookie Management
 // ============================================================================
+
+class SessionManager {
+    constructor(proxyConfiguration) {
+        this.proxyConfiguration = proxyConfiguration;
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+        this.cookies = [];
+        this.userAgent = getRandomUserAgent();
+        this.isInitialized = false;
+    }
+
+    async initialize() {
+        log.info('Initializing stealthy Firefox session...');
+
+        const launchOptions = {
+            headless: true,
+            // Firefox-specific stealth args
+            firefoxUserPrefs: {
+                // Disable telemetry
+                'toolkit.telemetry.enabled': false,
+                'toolkit.telemetry.unified': false,
+                'toolkit.telemetry.archive.enabled': false,
+                // Disable tracking protection to avoid issues
+                'privacy.trackingprotection.enabled': false,
+                'privacy.trackingprotection.pbmode.enabled': false,
+                // Disable webdriver detection
+                'dom.webdriver.enabled': false,
+                // Disable navigator.webdriver
+                'marionette.enabled': false,
+                // Enable WebGL (some sites check this)
+                'webgl.disabled': false,
+                // Disable safe browsing (can cause delays)
+                'browser.safebrowsing.enabled': false,
+                'browser.safebrowsing.malware.enabled': false,
+                // Disable prefetching
+                'network.prefetch-next': false,
+                'network.dns.disablePrefetch': true,
+                // Disable service workers
+                'dom.serviceWorkers.enabled': false,
+            },
+        };
+
+        // Add proxy if configured
+        if (this.proxyConfiguration) {
+            const proxyUrl = await this.proxyConfiguration.newUrl();
+            if (proxyUrl) {
+                const parsedProxy = new URL(proxyUrl);
+                launchOptions.proxy = {
+                    server: `${parsedProxy.protocol}//${parsedProxy.hostname}:${parsedProxy.port}`,
+                    username: parsedProxy.username,
+                    password: parsedProxy.password,
+                };
+                log.debug(`Using proxy: ${parsedProxy.hostname}`);
+            }
+        }
+
+        this.browser = await firefox.launch(launchOptions);
+
+        // Create context with realistic settings
+        const viewportWidth = 1920 + randomInt(-100, 100);
+        const viewportHeight = 1080 + randomInt(-50, 50);
+
+        this.context = await this.browser.newContext({
+            userAgent: this.userAgent,
+            viewport: { width: viewportWidth, height: viewportHeight },
+            locale: 'en-AU',
+            timezoneId: 'Australia/Sydney',
+            geolocation: { latitude: -31.9505, longitude: 115.8605 }, // Perth
+            permissions: ['geolocation'],
+            colorScheme: 'light',
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            isMobile: false,
+            javaScriptEnabled: true,
+            bypassCSP: true,
+            ignoreHTTPSErrors: true,
+            extraHTTPHeaders: {
+                'Accept-Language': 'en-AU,en-US;q=0.9,en;q=0.8',
+                DNT: '1',
+            },
+        });
+
+        // Block unnecessary resources for speed
+        await this.context.route('**/*', async (route) => {
+            const request = route.request();
+            const resourceType = request.resourceType();
+            const url = request.url();
+
+            // Block tracking and analytics
+            const blockedPatterns = [
+                'google-analytics',
+                'googletagmanager',
+                'facebook.net',
+                'doubleclick',
+                'hotjar',
+                'segment.io',
+                'amplitude',
+                'mixpanel',
+                'newrelic',
+                'optimizely',
+                'clarity.ms',
+            ];
+
+            const shouldBlock = blockedPatterns.some((pattern) => url.includes(pattern));
+
+            if (shouldBlock) {
+                await route.abort();
+            } else if (['font', 'media'].includes(resourceType)) {
+                // Block fonts and media to speed up
+                await route.abort();
+            } else {
+                await route.continue();
+            }
+        });
+
+        this.page = await this.context.newPage();
+
+        // Remove automation indicators
+        await this.page.addInitScript(() => {
+            // Override webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+
+            // Override plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                ],
+            });
+
+            // Override languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-AU', 'en-US', 'en'],
+            });
+
+            // Override platform
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'Win32',
+            });
+
+            // Override hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8,
+            });
+
+            // Override device memory
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8,
+            });
+
+            // Add Chrome object for compatibility
+            window.chrome = {
+                runtime: {},
+                loadTimes: () => ({}),
+                csi: () => ({}),
+                app: {},
+            };
+
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters);
+        });
+
+        // Warm-up: Visit homepage first to establish session
+        log.info('Warming up session by visiting homepage...');
+        try {
+            await this.page.goto(DOMAIN_BASE, {
+                waitUntil: 'domcontentloaded',
+                timeout: NAVIGATION_TIMEOUT_MS,
+            });
+            await randomDelay(2000, 4000);
+
+            // Simulate human behavior
+            await this.simulateHumanBehavior();
+
+            // Store cookies
+            this.cookies = await this.context.cookies();
+            log.info(`Session established with ${this.cookies.length} cookies`);
+        } catch (error) {
+            log.warning(`Homepage warm-up failed: ${error.message}, continuing anyway...`);
+        }
+
+        this.isInitialized = true;
+        return this;
+    }
+
+    async simulateHumanBehavior() {
+        try {
+            // Random mouse movements
+            const moves = randomInt(3, 6);
+            for (let i = 0; i < moves; i++) {
+                const x = randomInt(100, 1800);
+                const y = randomInt(100, 900);
+                await this.page.mouse.move(x, y, { steps: randomInt(5, 15) });
+                await randomDelay(100, 300);
+            }
+
+            // Scroll down a bit
+            await this.page.evaluate(() => {
+                window.scrollBy(0, Math.random() * 500 + 200);
+            });
+            await randomDelay(500, 1000);
+
+            // Scroll back up
+            await this.page.evaluate(() => {
+                window.scrollBy(0, -Math.random() * 300);
+            });
+        } catch (_) {
+            // Ignore errors in simulation
+        }
+    }
+
+    async navigateToUrl(url) {
+        if (!this.isInitialized) {
+            await this.initialize();
+        }
+
+        log.debug(`Navigating to: ${url}`);
+
+        try {
+            const response = await this.page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: NAVIGATION_TIMEOUT_MS,
+            });
+
+            // Wait for any dynamic content
+            await randomDelay(1500, 3000);
+
+            // Simulate human behavior
+            await this.simulateHumanBehavior();
+
+            // Update cookies
+            this.cookies = await this.context.cookies();
+
+            const html = await this.page.content();
+            const statusCode = response?.status() || 0;
+
+            // Check for blocking
+            if (html.includes('403 Forbidden') || html.includes('Access Denied') || html.includes('captcha')) {
+                log.warning('Possible blocking detected, attempting to refresh session...');
+                await this.refreshSession();
+                return await this.navigateToUrl(url);
+            }
+
+            return { html, statusCode, cookies: this.cookies };
+        } catch (error) {
+            log.error(`Navigation failed: ${error.message}`);
+            throw error;
+        }
+    }
+
+    getCookieString() {
+        return this.cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+    }
+
+    getCookiesForGot() {
+        return this.getCookieString();
+    }
+
+    async refreshSession() {
+        log.info('Refreshing browser session...');
+        if (this.browser) {
+            try {
+                await this.browser.close();
+            } catch (_) {
+                // Ignore close errors
+            }
+        }
+        this.isInitialized = false;
+        this.userAgent = getRandomUserAgent();
+        await this.initialize();
+    }
+
+    async close() {
+        if (this.browser) {
+            try {
+                await this.browser.close();
+            } catch (_) {
+                // Ignore
+            }
+        }
+        this.isInitialized = false;
+    }
+}
+
+// ============================================================================
+// HYBRID FETCH - Uses cookies from Playwright for got-scraping requests
+// ============================================================================
+
+const hybridFetch = async ({ url, sessionManager, retries = 2 }) => {
+    const cookieString = sessionManager.getCookiesForGot();
+    const userAgent = sessionManager.userAgent;
+
+    const headers = {
+        ...STEALTHY_HEADERS,
+        'User-Agent': userAgent,
+        Cookie: cookieString,
+        Referer: DOMAIN_BASE,
+    };
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            log.debug(`Hybrid fetch attempt ${attempt}/${retries}: ${url}`);
+
+            const response = await gotScraping({
+                url,
+                headers,
+                responseType: 'text',
+                timeout: { request: 20000 },
+                retry: { limit: 0 },
+                throwHttpErrors: false,
+            });
+
+            const body = response.body || '';
+            const statusCode = response.statusCode;
+
+            // Check for blocking
+            if (statusCode === 403 || statusCode === 503 || body.includes('403 Forbidden') || body.includes('Access Denied')) {
+                log.warning(`Request blocked (status: ${statusCode}), falling back to Playwright...`);
+                throw new Error('Blocked response');
+            }
+
+            if (statusCode >= 200 && statusCode < 400 && body.length > 1000) {
+                return { html: body, statusCode, source: 'got-scraping' };
+            }
+
+            throw new Error(`Invalid response: status=${statusCode}, length=${body.length}`);
+        } catch (error) {
+            log.debug(`Got-scraping failed: ${error.message}`);
+
+            if (attempt === retries) {
+                // Final attempt: use Playwright directly
+                log.info('Falling back to Playwright for direct fetch...');
+                const result = await sessionManager.navigateToUrl(url);
+                return { ...result, source: 'playwright' };
+            }
+
+            await randomDelay(1000, 2000);
+        }
+    }
+
+    // Should not reach here, but fallback anyway
+    const result = await sessionManager.navigateToUrl(url);
+    return { ...result, source: 'playwright' };
+};
+
+// ============================================================================
+// MULTI-TIER DATA EXTRACTION
+// ============================================================================
+
+const extractNextData = (html) => {
+    try {
+        const match = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([^<]+)<\/script>/);
+        if (match?.[1]) {
+            return JSON.parse(match[1]);
+        }
+    } catch (_) {
+        // Invalid JSON
+    }
+    return null;
+};
+
+const extractApolloState = (html) => {
+    const patterns = [
+        /window\.__APOLLO_STATE__\s*=\s*({.*?})(?:\s*;|\s*<\/script>)/s,
+        /window\.__INITIAL_STATE__\s*=\s*({.*?})(?:\s*;|\s*<\/script>)/s,
+        /window\.__INITIAL_DATA__\s*=\s*({.*?})(?:\s*;|\s*<\/script>)/s,
+    ];
+
+    for (const pattern of patterns) {
+        const match = html.match(pattern);
+        if (match?.[1]) {
+            try {
+                return JSON.parse(match[1]);
+            } catch (_) {
+                // Invalid JSON
+            }
+        }
+    }
+    return null;
+};
 
 const extractJsonLd = (html) => {
     const $ = cheerioLoad(html);
@@ -150,7 +542,7 @@ const extractJsonLd = (html) => {
                 }
             }
         } catch (_) {
-            // Invalid JSON-LD, skip
+            // Invalid JSON-LD
         }
     });
 
@@ -194,65 +586,26 @@ const parseJsonLdAgent = (jsonLd) => {
 };
 
 // ============================================================================
-// EMBEDDED STATE EXTRACTION
+// AGENT DATA NORMALIZATION
 // ============================================================================
-
-const createStealthHeaders = () => ({
-    ...STEALTHY_HEADERS,
-    'User-Agent': getRandomUserAgent(),
-    Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
-    'Cache-Control': 'no-cache',
-    Pragma: 'no-cache',
-    Referer: DOMAIN_BASE,
-});
-
-const safeJsonParse = (maybeJson) => {
-    if (!maybeJson) return null;
-    try {
-        return JSON.parse(maybeJson);
-    } catch (err) {
-        log.debug(`JSON parse failed: ${err.message}`);
-        return null;
-    }
-};
-
-const extractEmbeddedState = (html) => {
-    const patterns = [
-        /window\.__APOLLO_STATE__\s*=\s*({.*?})\s*;?/s,
-        /window\.__INITIAL_STATE__\s*=\s*({.*?})\s*;?/s,
-        /window\.__INITIAL_DATA__\s*=\s*({.*?})\s*;?/s,
-        /<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s,
-        /<script[^>]+type="application\/json"[^>]*>(.*?)<\/script>/s,
-    ];
-
-    for (const pattern of patterns) {
-        const match = html.match(pattern);
-        if (match?.[1]) {
-            const parsed = safeJsonParse(match[1]);
-            if (parsed) return parsed;
-        }
-    }
-
-    return null;
-};
 
 const isAgentLike = (obj) => {
     if (!obj || typeof obj !== 'object') return false;
     return Boolean(
         obj.agentId ||
-            obj.agentName ||
-            obj.firstName ||
-            obj.lastName ||
-            obj.name ||
-            obj.fullName ||
-            obj.displayName ||
-            obj.email ||
-            obj.phone ||
-            obj.profileUrl ||
-            obj.profilePageUrl ||
-            obj.profileSlug ||
-            obj.slug ||
-            obj.agencyName
+        obj.agentName ||
+        obj.firstName ||
+        obj.lastName ||
+        obj.name ||
+        obj.fullName ||
+        obj.displayName ||
+        obj.email ||
+        obj.phone ||
+        obj.profileUrl ||
+        obj.profilePageUrl ||
+        obj.profileSlug ||
+        obj.slug ||
+        obj.agencyName
     );
 };
 
@@ -344,7 +697,194 @@ const normalizeAgentFromJson = (rawAgent) => {
     return agent.url || agent.name ? agent : null;
 };
 
-const deriveNextPageUrl = ({ url, currentPage }) => {
+const addMetadata = (agent) => {
+    if (!agent) return agent;
+    agent.scrapedAt = agent.scrapedAt || new Date().toISOString();
+    agent.source = agent.source || DOMAIN_BASE;
+    return agent;
+};
+
+// ============================================================================
+// MULTI-TIER EXTRACTION FROM HTML
+// ============================================================================
+
+const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
+    let agents = [];
+    let totalResults = null;
+    let nextPage = null;
+    let extractionMethod = 'none';
+
+    // Tier 1: __NEXT_DATA__
+    const nextData = extractNextData(html);
+    if (nextData) {
+        const pageProps = nextData.props?.pageProps;
+        if (pageProps) {
+            const agentArray = locateAgentArray(pageProps);
+            if (agentArray.length > 0) {
+                agents = agentArray
+                    .map((item) => normalizeAgentFromJson(item))
+                    .filter((item) => item && (item.url || item.name));
+                extractionMethod = '__NEXT_DATA__';
+                log.info(`Extracted ${agents.length} agents from __NEXT_DATA__`);
+
+                // Try to get pagination info
+                totalResults = pageProps.totalAgents || pageProps.total || pageProps.pagination?.total || null;
+            }
+        }
+    }
+
+    // Tier 2: Apollo/Initial State
+    if (agents.length === 0) {
+        const apolloState = extractApolloState(html);
+        if (apolloState) {
+            const agentArray = locateAgentArray(apolloState);
+            if (agentArray.length > 0) {
+                agents = agentArray
+                    .map((item) => normalizeAgentFromJson(item))
+                    .filter((item) => item && (item.url || item.name));
+                extractionMethod = 'Apollo State';
+                log.info(`Extracted ${agents.length} agents from Apollo State`);
+            }
+        }
+    }
+
+    // Tier 3: JSON-LD
+    if (agents.length === 0) {
+        const jsonLd = extractJsonLd(html);
+        if (jsonLd.length > 0) {
+            const parsed = parseJsonLdAgent(jsonLd);
+            if (parsed) {
+                agents = [addMetadata(parsed)];
+                extractionMethod = 'JSON-LD';
+                log.info(`Extracted ${agents.length} agents from JSON-LD`);
+            }
+        }
+    }
+
+    // Tier 4: HTML Parsing
+    if (agents.length === 0) {
+        const htmlResult = parseAgentsFromHtml(html);
+        agents = htmlResult.agents;
+        totalResults = htmlResult.totalResults || totalResults;
+        nextPage = htmlResult.nextPage;
+        extractionMethod = 'HTML Parsing';
+        log.info(`Extracted ${agents.length} agents from HTML parsing`);
+    }
+
+    // Derive next page if not found
+    if (!nextPage && agents.length > 0) {
+        nextPage = deriveNextPageUrl(sourceUrl, currentPage);
+    }
+
+    return { agents: agents.map(addMetadata), totalResults, nextPage, extractionMethod };
+};
+
+const parseAgentsFromHtml = (html) => {
+    const $ = cheerioLoad(html);
+    const agents = [];
+    let totalResults = null;
+
+    // Multiple selector strategies
+    let agentCards = [];
+
+    // Strategy 1: data-testid patterns
+    agentCards = $(
+        '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], [data-testid*="agent-list-item"]'
+    ).toArray();
+
+    // Strategy 2: Class-based selectors
+    if (agentCards.length === 0) {
+        agentCards = $(
+            'article.agent-card, article[class*="agent"], div[class*="agent-card"], div[class*="agent-profile"], li[class*="agent"]'
+        ).toArray();
+    }
+
+    // Strategy 3: Generic patterns
+    if (agentCards.length === 0) {
+        agentCards = $('article, li, div[class*="card"]')
+            .toArray()
+            .filter((el) => {
+                const text = $(el).text().toLowerCase();
+                return (text.includes('agent') || text.includes('agency')) && text.length < 2000;
+            });
+    }
+
+    if (agentCards.length > MAX_CARD_PARSE) {
+        agentCards = agentCards.slice(0, MAX_CARD_PARSE);
+    }
+
+    for (const card of agentCards) {
+        try {
+            const $card = $(card);
+
+            const hrefs = $card
+                .find('a[href]')
+                .map((_, el) => $(el).attr('href'))
+                .get();
+            const agentHref = pickAgentHref(hrefs);
+            const agentUrl = ensureAbsoluteUrl(agentHref);
+
+            if (!isLikelyAgentUrl(agentUrl)) {
+                continue;
+            }
+
+            let nameText = cleanText(
+                $card.find('h3.css-1hakis5, [data-testid*="name"], [data-testid*="agent-name"], .agent-name, h2, h3, .title').first().text()
+            );
+            if (!nameText) nameText = cleanText($card.find('a').first().text());
+            if (!nameText || /find agents?/i.test(nameText)) continue;
+
+            const agent = {
+                id: null,
+                url: agentUrl,
+                name: nameText,
+                title: cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text()),
+                agency: cleanText($card.find('[data-testid*="agency"], .agency-name, [class*="agency"], [class*="company"]').first().text()),
+                agencyUrl: ensureAbsoluteUrl($card.find('a[href*="agency"], a[href*="agencies"]').first().attr('href')) || null,
+                phone: extractPhoneNumber(
+                    $card.find('a[href^="tel:"], [data-testid*="phone"], .phone').first().text() ||
+                    $card.find('a[href^="tel:"]').attr('href') ||
+                    ''
+                ),
+                email: extractEmail(
+                    $card.find('a[href^="mailto:"], [data-testid*="email"], .email').first().text() ||
+                    $card.find('a[href^="mailto:"]').attr('href') ||
+                    ''
+                ),
+                suburb: cleanText($card.find('[class*="suburb"], [class*="location"], [class*="address"]').first().text()),
+                profileImage: $card.find('img[data-testid*="agent"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
+                agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first().attr('src') || null,
+                currentListings: cleanText($card.find('[class*="listing"], [data-testid*="listing"]').first().text()),
+                soldProperties: cleanText($card.find('[class*="sold"], [data-testid*="sold"]').first().text()),
+                rating: cleanText(
+                    $card.find('[data-rating], .rating, .stars').first().attr('data-rating') || $card.find('.rating, .stars').first().text()
+                ),
+                source: DOMAIN_BASE,
+                scrapedAt: new Date().toISOString(),
+            };
+
+            const idMatch = agent.url?.match(/(\d{6,})(?:[/?#]|$)/);
+            agent.id = idMatch ? idMatch[1] : null;
+
+            agents.push(agent);
+        } catch (err) {
+            log.debug(`Failed to parse agent card: ${err.message}`);
+        }
+    }
+
+    // Extract pagination
+    let nextPageLink = $('a[aria-label="Go to next page"]').attr('href');
+    if (!nextPageLink) nextPageLink = $('a[rel="next"]').attr('href');
+    if (!nextPageLink) nextPageLink = $('a[aria-label*="Next"]').attr('href');
+
+    const totalResultsText = cleanText($('[data-testid*="total"], [class*="total-results"]').first().text());
+    const totalMatch = totalResultsText?.match(/([\d,]+)/);
+    if (totalMatch) totalResults = parseInt(totalMatch[1].replace(/,/g, ''), 10);
+
+    return { agents, totalResults, nextPage: ensureAbsoluteUrl(nextPageLink) };
+};
+
+const deriveNextPageUrl = (url, currentPage) => {
     try {
         const parsed = new URL(url);
         const current = currentPage || parseInt(parsed.searchParams.get('page') || '1', 10) || 1;
@@ -357,316 +897,36 @@ const deriveNextPageUrl = ({ url, currentPage }) => {
     }
 };
 
-const extractTotalResults = (payload) => {
-    const candidates = [
-        payload?.totalResults,
-        payload?.results?.total,
-        payload?.data?.total,
-        payload?.paging?.total,
-        payload?.pagination?.total,
-    ];
-    return candidates.find((val) => typeof val === 'number') || null;
-};
-
-const extractAgentsFromJsonPayload = ({ payload, sourceUrl, currentPage }) => {
-    const agentsArray = locateAgentArray(payload);
-    const agents = agentsArray
-        .map((item) => normalizeAgentFromJson(item))
-        .filter((item) => item && (item.url || item.name));
-
-    const totalResults = extractTotalResults(payload);
-
-    let nextPage = null;
-    const pagingCandidates = [payload?.paging, payload?.pagination, payload?.results?.paging, payload?.data?.paging];
-    for (const paging of pagingCandidates) {
-        if (paging?.next) {
-            nextPage = ensureAbsoluteUrl(paging.next);
-            break;
-        }
-        if (paging?.nextPage) {
-            nextPage = ensureAbsoluteUrl(paging.nextPage);
-            break;
-        }
-    }
-
-    if (!nextPage && agents.length > 0) {
-        nextPage = deriveNextPageUrl({ url: sourceUrl, currentPage });
-    }
-
-    return { agents, totalResults, nextPage };
-};
-
-const addMetadata = (agent) => {
-    if (!agent) return agent;
-    agent.scrapedAt = agent.scrapedAt || new Date().toISOString();
-    agent.source = agent.source || DOMAIN_BASE;
-    return agent;
-};
-
-// ============================================================================
-// HTML PARSING METHOD
-// ============================================================================
-
-const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, currentPage = 1 }) => {
-    try {
-        log.debug(`Scraping agent listing page: ${url}`);
-
-        let pageHtml = html;
-
-        if (!pageHtml) {
-            const headers = createStealthHeaders();
-
-            const response = await gotScraping({
-                url,
-                headers,
-                proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-                responseType: 'text',
-                retry: {
-                    limit: 2,
-                    statusCodes: [408, 429, 500, 502, 503, 504],
-                },
-                timeout: { request: 15000 },
-            });
-
-            pageHtml = response.body;
-        }
-
-        const $ = cheerioLoad(pageHtml);
-        const agents = [];
-        let totalResults = null;
-        let nextPageCandidate = null;
-
-        const embeddedState = extractEmbeddedState(pageHtml);
-        if (embeddedState) {
-            const embeddedResult = extractAgentsFromJsonPayload({
-                payload: embeddedState,
-                sourceUrl: url,
-                currentPage,
-            });
-            if (embeddedResult.agents.length > 0) {
-                log.debug(`Extracted ${embeddedResult.agents.length} agents from embedded JSON`);
-                embeddedResult.agents.forEach((a) => agents.push(addMetadata(a)));
-                totalResults = embeddedResult.totalResults || totalResults;
-                nextPageCandidate = embeddedResult.nextPage || nextPageCandidate;
-            }
-        }
-
-        if (pageHtml.includes('403 Forbidden') || pageHtml.length < 1000) {
-            log.warning('Possible blocking or incomplete page received');
-        }
-
-        let agentCards = [];
-        agentCards = [
-            ...$('[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], [data-testid*="agent-list-item"]').toArray(),
-        ];
-        log.debug(`[Strategy 1] Found ${agentCards.length} cards with data-testid patterns`);
-
-        if (agentCards.length === 0) {
-            agentCards = $('article.agent-card, article[class*="agent"], div[class*="agent-card"], div[class*="agent-profile"], li[class*="agent"]').toArray();
-            log.debug(`[Strategy 2] Found ${agentCards.length} cards with class selectors`);
-        }
-
-        if (agentCards.length === 0) {
-            agentCards = $('article, li, div[class*="card"]').toArray().filter((el) => {
-                const text = $(el).text().toLowerCase();
-                return text.includes('agent') || text.includes('agency');
-            });
-            log.debug(`[Strategy 3] Found ${agentCards.length} cards with generic selectors`);
-        }
-
-        if (agentCards.length === 0) {
-            log.warning('No agent cards found with any selector strategy');
-            log.debug(`Page HTML sample: ${pageHtml.substring(0, 500)}`);
-        }
-
-        if (agentCards.length > MAX_CARD_PARSE) {
-            agentCards = agentCards.slice(0, MAX_CARD_PARSE);
-        }
-
-        for (const card of agentCards) {
-            try {
-                const $card = $(card);
-
-                const hrefs = $card
-                    .find('a[href]')
-                    .map((_, el) => $(el).attr('href'))
-                    .get();
-                const agentHref = pickAgentHref(hrefs);
-                const agentUrl = ensureAbsoluteUrl(agentHref);
-
-                if (!isLikelyAgentUrl(agentUrl)) {
-                    continue;
-                }
-
-                let nameText = cleanText($card.find('h3.css-1hakis5, [data-testid*="name"], [data-testid*="agent-name"], .agent-name, h2, h3, .title').first().text());
-                if (!nameText) nameText = cleanText($card.find('a').first().text());
-                if (!nameText || /find agents?/i.test(nameText)) continue;
-
-                const agent = {
-                    id: null,
-                    url: agentUrl,
-                    name: nameText,
-                    title: cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text()),
-                    agency: cleanText($card.find('[data-testid*="agency"], .agency-name, [class*="agency"], [class*="company"]').first().text()),
-                    agencyUrl: ensureAbsoluteUrl($card.find('a[href*="agency"], a[href*="agencies"]').first().attr('href')) || null,
-                    phone: extractPhoneNumber(
-                        $card.find('a[href^="tel:"], [data-testid*="phone"], .phone').first().text() ||
-                        $card.find('a[href^="tel:"]').attr('href') || ''
-                    ),
-                    email: extractEmail(
-                        $card.find('a[href^="mailto:"], [data-testid*="email"], .email').first().text() ||
-                        $card.find('a[href^="mailto:"]').attr('href') || ''
-                    ),
-                    suburb: cleanText($card.find('[class*="suburb"], [class*="location"], [class*="address"]').first().text()),
-                    profileImage: $card.find('img[data-testid*="agent"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
-                    agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first().attr('src') || null,
-                    currentListings: cleanText($card.find('[class*="listing"], [data-testid*="listing"]').first().text()),
-                    soldProperties: cleanText($card.find('[class*="sold"], [data-testid*="sold"]').first().text()),
-                    rating: cleanText($card.find('[data-rating], .rating, .stars').first().attr('data-rating') || $card.find('.rating, .stars').first().text()),
-                    source: DOMAIN_BASE,
-                    scrapedAt: new Date().toISOString(),
-                };
-
-                const idMatch = agent.url?.match(/(\d{6,})(?:[/?#]|$)/);
-                agent.id = idMatch ? idMatch[1] : null;
-
-                agents.push(addMetadata(agent));
-            } catch (err) {
-                log.warning(`Failed to parse agent card: ${err.message}`);
-            }
-        }
-
-        let nextPageLink = $('a[aria-label="Go to next page"]').attr('href');
-        if (!nextPageLink) nextPageLink = $('a[rel="next"]').attr('href');
-        if (!nextPageLink) nextPageLink = $('a[aria-label*="Next"]').attr('href');
-
-        const totalResultsText = cleanText($('[data-testid*="total"], [class*="total-results"]').first().text());
-        const totalMatch = totalResultsText?.match(/([\d,]+)/);
-        if (totalMatch) totalResults = totalResults || parseInt(totalMatch[1].replace(/,/g, ''), 10);
-
-        const nextPage = ensureAbsoluteUrl(nextPageCandidate || nextPageLink) || deriveNextPageUrl({ url, currentPage });
-
-        return { agents, nextPage, totalResults };
-    } catch (error) {
-        log.error(`Failed to scrape agent listing page: ${error.message}`);
-        return { agents: [], nextPage: null, totalResults: null };
-    }
-};
-
-// ============================================================================
-// PLAYWRIGHT BROWSER METHOD
-// ============================================================================
-
-const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 }) => {
-    let browser;
-
-    try {
-        log.debug(`Scraping via Playwright: ${url}`);
-
-        const launchOptions = {
-            headless: true,
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-            ],
-        };
-
-        if (proxyConfiguration) {
-            const proxyUrl = await proxyConfiguration.newUrl();
-            launchOptions.proxy = { server: proxyUrl };
-        }
-
-        browser = await chromium.launch(launchOptions);
-        const context = await browser.newContext({
-            userAgent: getRandomUserAgent(),
-            viewport: { width: 1920, height: 1080 },
-            locale: 'en-AU',
-        });
-
-        const page = await context.newPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT_MS });
-
-        try {
-            await page.waitForSelector('h3.css-1hakis5, [data-testid*="agent"]', { timeout: PLAYWRIGHT_TIMEOUT_MS });
-        } catch (e) {
-            log.warning('Timeout waiting for agent cards, continuing anyway');
-        }
-
-        await page.evaluate(async () => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 300;
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-
-                    if (totalHeight >= scrollHeight) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 100);
-            });
-        });
-
-        const html = await page.content();
-        await browser.close();
-
-        return await scrapeAgentListingPage({ url, proxyConfiguration, html, currentPage });
-    } catch (error) {
-        log.error(`Playwright scraping failed: ${error.message}`);
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (_) {
-                // ignore
-            }
-        }
-        return { agents: [], nextPage: null, totalResults: null };
-    }
-};
-
 // ============================================================================
 // DETAIL PAGE SCRAPING
 // ============================================================================
 
-const scrapeAgentDetails = async ({ url, proxyConfiguration }) => {
+const scrapeAgentDetails = async ({ url, sessionManager }) => {
     try {
         log.debug(`Scraping agent details: ${url}`);
 
-        const headers = createStealthHeaders();
-        let response = null;
-        try {
-            response = await gotScraping({
-                url,
-                headers,
-                proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-                responseType: 'text',
-                retry: {
-                    limit: 1,
-                    statusCodes: [408, 429, 500, 502, 503, 504],
-                },
-                timeout: { request: 20000 },
-            });
-        } catch (err) {
-            log.debug(`Detail gotScraping failed, trying Playwright: ${err.message}`);
-            const pageResult = await scrapeViaPlaywright({ url, proxyConfiguration, currentPage: 1 });
-            if (pageResult && pageResult.agents && pageResult.agents.length) {
-                return pageResult.agents[0];
-            }
-            throw err;
-        }
+        const { html } = await hybridFetch({ url, sessionManager, retries: 2 });
 
-        const $ = cheerioLoad(response?.body || '');
+        const $ = cheerioLoad(html);
         const details = {};
 
-        const jsonLdData = extractJsonLd(response.body);
+        // JSON-LD extraction
+        const jsonLdData = extractJsonLd(html);
         const jsonLdAgent = parseJsonLdAgent(jsonLdData);
         if (jsonLdAgent) Object.assign(details, jsonLdAgent);
 
+        // __NEXT_DATA__ extraction
+        const nextData = extractNextData(html);
+        if (nextData?.props?.pageProps?.agent) {
+            const agentData = normalizeAgentFromJson(nextData.props.pageProps.agent);
+            if (agentData) {
+                for (const [key, value] of Object.entries(agentData)) {
+                    if (value && !details[key]) details[key] = value;
+                }
+            }
+        }
+
+        // HTML fallback
         if (!details.name) {
             details.name = cleanText($('[data-testid="agent-profile-name"], h1, [class*="agent-name"]').first().text());
         }
@@ -687,216 +947,19 @@ const scrapeAgentDetails = async ({ url, proxyConfiguration }) => {
         if (!details.officeAddress) {
             details.officeAddress = cleanText($('[data-testid="agent-address"], [class*="office-address"]').first().text());
         }
+        if (!details.biography) {
+            details.biography = cleanText($('[data-testid="agent-bio"], [class*="biography"], [class*="about"]').first().text());
+        }
 
         return details;
     } catch (error) {
-        log.error(`Failed to scrape agent details: ${error.message}`);
+        log.warning(`Failed to scrape agent details: ${error.message}`);
         return {};
     }
 };
 
 // ============================================================================
-// MAIN ACTOR LOGIC
-// ============================================================================
-
-Actor.main(async () => {
-    const input = await Actor.getInput();
-
-    const {
-        startUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION),
-        maxResults = 50,
-        maxPages = 5,
-        collectDetails = true,
-        usePlaywright = true,
-        maxConcurrency = 3,
-        proxyConfiguration,
-        location = null,
-        suburb = null,
-        state = null,
-        agencyName = null,
-        specialization = null,
-    } = input || {};
-
-    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
-
-    const validatedMaxResults = Math.max(1, Math.min(maxResults || 50, 1000));
-    const validatedMaxPages = Math.max(1, Math.min(maxPages || 5, 50));
-    const pageEstimate = Math.ceil(validatedMaxResults / Math.max(20, DEFAULT_PAGE_SIZE));
-    const pageLimit = Math.min(
-        50,
-        Math.max(
-            validatedMaxPages,
-            pageEstimate,
-            Math.ceil(validatedMaxResults / 15),
-        ),
-    );
-
-    if (!startUrl.includes('domain.com.au')) {
-        throw new Error('Invalid input: startUrl must be from domain.com.au');
-    }
-
-    log.info('Domain.com.au Real Estate Agents Scraper started', {
-        startUrl,
-        maxResults: validatedMaxResults,
-        maxPages: pageLimit,
-        collectDetails,
-    });
-
-    let searchUrl = startUrl;
-
-    if (location || suburb || state || agencyName || specialization) {
-        let baseUrl = DOMAIN_BASE;
-
-        if (location) {
-            baseUrl = buildAgentLocationUrl(location.toLowerCase().replace(/\s+/g, '-'));
-        } else if (suburb) {
-            baseUrl = buildAgentLocationUrl(suburb.toLowerCase().replace(/\s+/g, '-'));
-        } else if (state) {
-            baseUrl = buildAgentLocationUrl(state.toLowerCase().replace(/\s+/g, '-'));
-        } else {
-            baseUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
-        }
-
-        const params = new URLSearchParams();
-        if (agencyName) params.append('agency', agencyName);
-        if (specialization) params.append('specialization', specialization);
-
-        const queryString = params.toString();
-        searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
-    }
-
-    if (isRootAgentSearchUrl(searchUrl)) {
-        searchUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
-        log.warning(`Root search has no listings. Using default location: ${DEFAULT_AGENT_LOCATION}`);
-    }
-
-    log.info(`Final search URL: ${searchUrl}`);
-
-    const allAgents = [];
-    const seenIds = new Set();
-    let currentPage = 1;
-    let nextPageUrl = searchUrl;
-    let totalResultsCount = null;
-    const datasetPusher = createDatasetPusher(DATASET_BATCH_SIZE);
-    const detailLimiter = collectDetails ? createConcurrencyLimiter(Math.max(1, Math.min(maxConcurrency || 3, 10))) : null;
-    const detailTasks = [];
-    let detailsCollected = 0;
-
-    while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
-        log.info(
-            `Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`,
-            { url: nextPageUrl },
-        );
-
-        let result = await scrapeAgentListingPage({
-            url: nextPageUrl,
-            proxyConfiguration: proxyConfig,
-            currentPage,
-        });
-
-        const shouldBrowserFallback =
-            (ENABLE_BROWSER_FALLBACK || usePlaywright) &&
-            (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
-
-        if (shouldBrowserFallback) {
-            log.info('Attempting Playwright fallback...');
-            result = await scrapeViaPlaywright({
-                url: nextPageUrl,
-                proxyConfiguration: proxyConfig,
-                currentPage,
-            });
-        }
-
-        if (!result || result.agents.length === 0) {
-            log.warning(`No agents found on page ${currentPage}, stopping pagination`);
-            break;
-        }
-
-        if (!result.nextPage && result.agents.length > 0) {
-            result.nextPage = deriveNextPageUrl({ url: nextPageUrl, currentPage });
-        }
-
-        if (result.totalResults && !totalResultsCount) {
-            totalResultsCount = result.totalResults;
-            log.info(`Total available: ${totalResultsCount} agents`);
-        }
-
-        let addedThisPage = 0;
-        const newItemsThisPage = [];
-        for (const agent of result.agents) {
-            const dedupeKey = agent.id || agent.url || agent.name;
-            if (!dedupeKey || seenIds.has(dedupeKey)) continue;
-
-            seenIds.add(dedupeKey);
-            const normalized = addMetadata(agent);
-            allAgents.push(normalized);
-            newItemsThisPage.push({ ...normalized });
-            addedThisPage++;
-
-            if (collectDetails && detailLimiter) {
-                detailTasks.push(
-                    detailLimiter(async () => {
-                        try {
-                            if (!normalized.url || !isLikelyAgentUrl(normalized.url)) return;
-                            const details = await scrapeAgentDetails({
-                                url: normalized.url,
-                                proxyConfiguration: proxyConfig,
-                            });
-
-                            for (const [key, value] of Object.entries(details)) {
-                                if (value && !normalized[key]) normalized[key] = value;
-                            }
-
-                            detailsCollected++;
-                            datasetPusher.enqueue({ ...addMetadata(normalized) });
-                            await sleep(150 + Math.random() * 350);
-                        } catch (error) {
-                            log.warning(`Failed details for ${normalized.url}: ${error.message}`);
-                            datasetPusher.enqueue({ ...addMetadata(normalized) });
-                        }
-                    }),
-                );
-            }
-
-            if (allAgents.length >= validatedMaxResults) break;
-        }
-
-        log.info(`Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`);
-        if (!collectDetails && newItemsThisPage.length) {
-            datasetPusher.enqueue(newItemsThisPage);
-        }
-
-        nextPageUrl = result.nextPage;
-        currentPage++;
-
-        if (nextPageUrl && allAgents.length < validatedMaxResults) {
-            const delay = 500 + Math.random() * 900;
-            log.debug(`Rate limiting: ${Math.round(delay)}ms before next page`);
-            await sleep(delay);
-        }
-    }
-
-    if (collectDetails && allAgents.length > 0) {
-        log.info(`Collecting full details for ${allAgents.length} agents...`);
-        await Promise.all(detailTasks);
-        await datasetPusher.flush();
-        log.info(`Details collected for ${detailsCollected}/${allAgents.length} agents`);
-    } else {
-        await datasetPusher.flush();
-    }
-
-    log.info('='.repeat(70));
-    log.info('SCRAPING COMPLETED SUCCESSFULLY');
-    log.info('='.repeat(70));
-    log.info(`Agents scraped: ${allAgents.length}/${validatedMaxResults}`);
-    log.info(`Pages processed: ${currentPage - 1}/${pageLimit}`);
-    log.info(`Details collected: ${collectDetails ? 'YES' : 'NO'}`);
-    log.info(`Total available: ${totalResultsCount || 'Unknown'}`);
-    log.info('='.repeat(70));
-});
-
-// ============================================================================
-// HELPER: Concurrency Limiter
+// HELPER: Concurrency Limiter & Dataset Pusher
 // ============================================================================
 
 function createConcurrencyLimiter(maxConcurrency) {
@@ -918,10 +981,11 @@ function createConcurrencyLimiter(maxConcurrency) {
             });
     };
 
-    return (task) => new Promise((resolve, reject) => {
-        queue.push({ task, resolve, reject });
-        next();
-    });
+    return (task) =>
+        new Promise((resolve, reject) => {
+            queue.push({ task, resolve, reject });
+            next();
+        });
 }
 
 function createDatasetPusher(batchSize) {
@@ -952,3 +1016,198 @@ function createDatasetPusher(batchSize) {
 
     return { enqueue, flush };
 }
+
+// ============================================================================
+// MAIN ACTOR LOGIC
+// ============================================================================
+
+Actor.main(async () => {
+    const input = await Actor.getInput();
+
+    const {
+        startUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION),
+        maxResults = 50,
+        maxPages = 5,
+        collectDetails = true,
+        maxConcurrency = 3,
+        proxyConfiguration,
+        location = null,
+        suburb = null,
+        state = null,
+        agencyName = null,
+        specialization = null,
+    } = input || {};
+
+    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
+
+    const validatedMaxResults = Math.max(1, Math.min(maxResults || 50, 1000));
+    const validatedMaxPages = Math.max(1, Math.min(maxPages || 5, 50));
+    const pageEstimate = Math.ceil(validatedMaxResults / Math.max(20, DEFAULT_PAGE_SIZE));
+    const pageLimit = Math.min(
+        50,
+        Math.max(validatedMaxPages, pageEstimate, Math.ceil(validatedMaxResults / 15))
+    );
+
+    if (!startUrl.includes('domain.com.au')) {
+        throw new Error('Invalid input: startUrl must be from domain.com.au');
+    }
+
+    log.info('Domain.com.au Real Estate Agents Scraper started', {
+        startUrl,
+        maxResults: validatedMaxResults,
+        maxPages: pageLimit,
+        collectDetails,
+    });
+
+    // Build search URL
+    let searchUrl = startUrl;
+
+    if (location || suburb || state || agencyName || specialization) {
+        let baseUrl = DOMAIN_BASE;
+
+        if (location) {
+            baseUrl = buildAgentLocationUrl(location.toLowerCase().replace(/\s+/g, '-'));
+        } else if (suburb) {
+            baseUrl = buildAgentLocationUrl(suburb.toLowerCase().replace(/\s+/g, '-'));
+        } else if (state) {
+            baseUrl = buildAgentLocationUrl(state.toLowerCase().replace(/\s+/g, '-'));
+        } else {
+            baseUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
+        }
+
+        const params = new URLSearchParams();
+        if (agencyName) params.append('agency', agencyName);
+        if (specialization) params.append('specialization', specialization);
+
+        const queryString = params.toString();
+        searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+    }
+
+    if (isRootAgentSearchUrl(searchUrl)) {
+        searchUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
+        log.warning(`Root search has no listings. Using default location: ${DEFAULT_AGENT_LOCATION}`);
+    }
+
+    log.info(`Final search URL: ${searchUrl}`);
+
+    // Initialize session manager with stealth browser
+    const sessionManager = new SessionManager(proxyConfig);
+    await sessionManager.initialize();
+
+    const allAgents = [];
+    const seenIds = new Set();
+    let currentPage = 1;
+    let nextPageUrl = searchUrl;
+    let totalResultsCount = null;
+    const datasetPusher = createDatasetPusher(DATASET_BATCH_SIZE);
+    const detailLimiter = collectDetails ? createConcurrencyLimiter(Math.max(1, Math.min(maxConcurrency || 3, 10))) : null;
+    const detailTasks = [];
+    let detailsCollected = 0;
+
+    try {
+        while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
+            log.info(`Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`, {
+                url: nextPageUrl,
+            });
+
+            // Fetch page using hybrid approach
+            const { html, source } = await hybridFetch({
+                url: nextPageUrl,
+                sessionManager,
+                retries: 2,
+            });
+
+            log.debug(`Page fetched via ${source}`);
+
+            // Extract agents using multi-tier approach
+            const result = extractAgentsMultiTier(html, nextPageUrl, currentPage);
+
+            if (!result || result.agents.length === 0) {
+                log.warning(`No agents found on page ${currentPage}, stopping pagination`);
+                break;
+            }
+
+            log.info(`Extraction method: ${result.extractionMethod}, found ${result.agents.length} agents`);
+
+            if (result.totalResults && !totalResultsCount) {
+                totalResultsCount = result.totalResults;
+                log.info(`Total available: ${totalResultsCount} agents`);
+            }
+
+            let addedThisPage = 0;
+            const newItemsThisPage = [];
+            for (const agent of result.agents) {
+                const dedupeKey = agent.id || agent.url || agent.name;
+                if (!dedupeKey || seenIds.has(dedupeKey)) continue;
+
+                seenIds.add(dedupeKey);
+                const normalized = addMetadata(agent);
+                allAgents.push(normalized);
+                newItemsThisPage.push({ ...normalized });
+                addedThisPage++;
+
+                if (collectDetails && detailLimiter) {
+                    detailTasks.push(
+                        detailLimiter(async () => {
+                            try {
+                                if (!normalized.url || !isLikelyAgentUrl(normalized.url)) return;
+                                const details = await scrapeAgentDetails({
+                                    url: normalized.url,
+                                    sessionManager,
+                                });
+
+                                for (const [key, value] of Object.entries(details)) {
+                                    if (value && !normalized[key]) normalized[key] = value;
+                                }
+
+                                detailsCollected++;
+                                datasetPusher.enqueue({ ...addMetadata(normalized) });
+                                await randomDelay(200, 500);
+                            } catch (error) {
+                                log.warning(`Failed details for ${normalized.url}: ${error.message}`);
+                                datasetPusher.enqueue({ ...addMetadata(normalized) });
+                            }
+                        })
+                    );
+                }
+
+                if (allAgents.length >= validatedMaxResults) break;
+            }
+
+            log.info(`Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`);
+            if (!collectDetails && newItemsThisPage.length) {
+                datasetPusher.enqueue(newItemsThisPage);
+            }
+
+            nextPageUrl = result.nextPage;
+            currentPage++;
+
+            if (nextPageUrl && allAgents.length < validatedMaxResults) {
+                const delay = 1500 + Math.random() * 2000;
+                log.debug(`Rate limiting: ${Math.round(delay)}ms before next page`);
+                await sleep(delay);
+            }
+        }
+
+        if (collectDetails && allAgents.length > 0) {
+            log.info(`Collecting full details for ${allAgents.length} agents...`);
+            await Promise.all(detailTasks);
+            await datasetPusher.flush();
+            log.info(`Details collected for ${detailsCollected}/${allAgents.length} agents`);
+        } else {
+            await datasetPusher.flush();
+        }
+    } finally {
+        // Clean up browser
+        await sessionManager.close();
+    }
+
+    log.info('='.repeat(70));
+    log.info('SCRAPING COMPLETED SUCCESSFULLY');
+    log.info('='.repeat(70));
+    log.info(`Agents scraped: ${allAgents.length}/${validatedMaxResults}`);
+    log.info(`Pages processed: ${currentPage - 1}/${pageLimit}`);
+    log.info(`Details collected: ${collectDetails ? 'YES' : 'NO'}`);
+    log.info(`Total available: ${totalResultsCount || 'Unknown'}`);
+    log.info('='.repeat(70));
+});

@@ -1,4 +1,3 @@
-// Domain.com.au Real Estate Agents Scraper - Modern Multi-Method Extraction
 import { Actor, log } from 'apify';
 import { Dataset, gotScraping } from 'crawlee';
 import { chromium } from 'playwright';
@@ -9,9 +8,8 @@ import { load as cheerioLoad } from 'cheerio';
 // ============================================================================
 
 const DOMAIN_BASE = 'https://www.domain.com.au';
-const DEFAULT_AGENT_LOCATION_FALLBACKS = ['perth-wa-6000', 'sydney-nsw', 'melbourne-vic'];
+const DEFAULT_AGENT_LOCATION = 'perth-wa-6000';
 
-// Stealthy User Agents rotation
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -20,11 +18,11 @@ const USER_AGENTS = [
 ];
 
 const STEALTHY_HEADERS = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'en-AU,en-US;q=0.9,en;q=0.8',
-    'DNT': '1',
-    'Referer': DOMAIN_BASE,
+    DNT: '1',
+    Referer: DOMAIN_BASE,
     'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="121", "Google Chrome";v="121"',
     'Sec-Ch-Ua-Mobile': '?0',
     'Sec-Ch-Ua-Platform': '"Windows"',
@@ -37,8 +35,10 @@ const STEALTHY_HEADERS = {
 };
 
 const ENABLE_BROWSER_FALLBACK = false;
-const PAGE_REQUEST_TIMEOUT_MS = 25000;
-const PLAYWRIGHT_NAV_TIMEOUT_MS = 60000;
+const DEFAULT_PAGE_SIZE = 40;
+const MAX_CARD_PARSE = 160;
+const DATASET_BATCH_SIZE = 10;
+const PLAYWRIGHT_TIMEOUT_MS = 45000;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -50,7 +50,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const cleanText = (text) => {
     if (!text) return null;
-    return text.replace(/\s+/g, ' ').trim();
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    return cleaned.length ? cleaned : null;
 };
 
 const ensureAbsoluteUrl = (url) => {
@@ -71,8 +72,6 @@ const isRootAgentSearchUrl = (url) => {
     }
 };
 
-const LOCATION_SLUG_REGEX = /-(nsw|vic|qld|wa|sa|tas|act|nt)(-\d{4})?$/i;
-
 const isLikelyAgentUrl = (url) => {
     if (!url) return false;
     const normalized = ensureAbsoluteUrl(url);
@@ -91,7 +90,9 @@ const isLikelyAgentUrl = (url) => {
         const baseSegment = segments[0] || '';
 
         if (baseSegment === 'real-estate-agents' && segments.length === 1) return false;
-        if (baseSegment === 'real-estate-agents' && segments.length === 2 && LOCATION_SLUG_REGEX.test(last)) return false;
+        if (baseSegment === 'real-estate-agents' && segments.length === 2 && /-(nsw|vic|qld|wa|sa|tas|act|nt)(-\d{4})?$/i.test(last)) {
+            return false;
+        }
 
         const looksLikeSlug = last.length > 3 && /[a-z]/i.test(last);
         const hasId = /\d{5,}/.test(last);
@@ -118,7 +119,6 @@ const extractPhoneNumber = (text) => {
     if (!text) return null;
     const cleaned = cleanText(text);
     if (!cleaned) return null;
-    // Match Australian phone numbers
     const phoneMatch = cleaned.match(/(?:\+?61|0)?[2-478](?:[ -]?\d){8}/);
     return phoneMatch ? phoneMatch[0] : null;
 };
@@ -149,7 +149,7 @@ const extractJsonLd = (html) => {
                     jsonLdData.push(data);
                 }
             }
-        } catch (e) {
+        } catch (_) {
             // Invalid JSON-LD, skip
         }
     });
@@ -162,24 +162,23 @@ const parseJsonLdAgent = (jsonLd) => {
 
     for (const data of jsonLd) {
         const type = data['@type'];
-        
         if (type === 'Person' || type === 'RealEstateAgent' || type === 'Employee') {
             agent.name = data.name || agent.name;
             agent.email = data.email || agent.email;
             agent.phone = data.telephone || data.phone || agent.phone;
             agent.title = data.jobTitle || data.title || agent.title;
-            
+
             if (data.image) {
                 agent.profileImage = typeof data.image === 'string' ? data.image : data.image.url;
             }
-            
+
             if (data.address) {
                 agent.officeAddress = data.address.streetAddress || agent.officeAddress;
                 agent.suburb = data.address.addressLocality || agent.suburb;
                 agent.state = data.address.addressRegion || agent.state;
                 agent.postcode = data.address.postalCode || agent.postcode;
             }
-            
+
             if (data.worksFor) {
                 agent.agency = data.worksFor.name || agent.agency;
                 agent.agencyUrl = data.worksFor.url || agent.agencyUrl;
@@ -189,40 +188,22 @@ const parseJsonLdAgent = (jsonLd) => {
                 agent.biography = data.description;
             }
         }
-        
-        if (type === 'Organization' || type === 'RealEstateAgency') {
-            if (!agent.agency) {
-                agent.agency = data.name;
-            }
-            if (!agent.agencyUrl) {
-                agent.agencyUrl = data.url;
-            }
-            if (data.logo) {
-                agent.agencyLogo = typeof data.logo === 'string' ? data.logo : data.logo.url;
-            }
-        }
     }
 
     return Object.keys(agent).length > 0 ? agent : null;
 };
 
 // ============================================================================
-// JSON API / EMBEDDED STATE EXTRACTION
+// EMBEDDED STATE EXTRACTION
 // ============================================================================
-
-const DEFAULT_PAGE_SIZE = 40;
-const MAX_CARD_PARSE = 160;
-const DATASET_BATCH_SIZE = 10;
 
 const createStealthHeaders = () => ({
     ...STEALTHY_HEADERS,
     'User-Agent': getRandomUserAgent(),
-    'Accept': 'application/json,text/html;q=0.9,*/*;q=0.8',
+    Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
     'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Referer': DOMAIN_BASE,
-    'Origin': DOMAIN_BASE,
-    'X-Requested-With': 'XMLHttpRequest',
+    Pragma: 'no-cache',
+    Referer: DOMAIN_BASE,
 });
 
 const safeJsonParse = (maybeJson) => {
@@ -240,9 +221,7 @@ const extractEmbeddedState = (html) => {
         /window\.__APOLLO_STATE__\s*=\s*({.*?})\s*;?/s,
         /window\.__INITIAL_STATE__\s*=\s*({.*?})\s*;?/s,
         /window\.__INITIAL_DATA__\s*=\s*({.*?})\s*;?/s,
-        /window\.__REDUX_STATE__\s*=\s*({.*?})\s*;?/s,
         /<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s,
-        /<script[^>]+id="__APOLLO_STATE__"[^>]*>(.*?)<\/script>/s,
         /<script[^>]+type="application\/json"[^>]*>(.*?)<\/script>/s,
     ];
 
@@ -271,7 +250,6 @@ const isAgentLike = (obj) => {
             obj.phone ||
             obj.profileUrl ||
             obj.profilePageUrl ||
-            obj.profilePageSlug ||
             obj.profileSlug ||
             obj.slug ||
             obj.agencyName
@@ -321,7 +299,6 @@ const normalizeAgentFromJson = (rawAgent) => {
         agentData.url ||
         agentData.profileUrl ||
         agentData.profilePageUrl ||
-        agentData.profilePageSlug ||
         agentData.profileSlug ||
         agentData.slug ||
         agentData.canonicalUrl ||
@@ -331,8 +308,8 @@ const normalizeAgentFromJson = (rawAgent) => {
     const agent = {
         id: String(agentData.id || agentData.agentId || agentData.profileId || '') || null,
         url: isLikelyAgentUrl(normalizedUrl) ? normalizedUrl : null,
-        name: agentData.name || agentData.fullName || agentData.displayName || agentData.agentName || 
-              (agentData.firstName && agentData.lastName ? `${agentData.firstName} ${agentData.lastName}` : null),
+        name: agentData.name || agentData.fullName || agentData.displayName || agentData.agentName ||
+            (agentData.firstName && agentData.lastName ? `${agentData.firstName} ${agentData.lastName}` : null),
         firstName: agentData.firstName || agentData.givenName || null,
         lastName: agentData.lastName || agentData.familyName || null,
         title: agentData.title || agentData.jobTitle || agentData.position || agentData.role || null,
@@ -365,19 +342,6 @@ const normalizeAgentFromJson = (rawAgent) => {
     }
 
     return agent.url || agent.name ? agent : null;
-};
-
-const withPageParams = (url, page) => {
-    try {
-        const parsed = new URL(url);
-        const currentPage = Number.isFinite(page) ? page : parseInt(parsed.searchParams.get('page') || '1', 10) || 1;
-        parsed.searchParams.set('page', String(currentPage));
-        if (!parsed.searchParams.get('pageSize')) parsed.searchParams.set('pageSize', String(DEFAULT_PAGE_SIZE));
-        return parsed.toString();
-    } catch (err) {
-        log.debug(`Failed to apply page params: ${err.message}`);
-        return url;
-    }
 };
 
 const deriveNextPageUrl = ({ url, currentPage }) => {
@@ -432,97 +396,6 @@ const extractAgentsFromJsonPayload = ({ payload, sourceUrl, currentPage }) => {
     return { agents, totalResults, nextPage };
 };
 
-const findFirstAgentObject = (payload) => {
-    const visited = new Set();
-    const queue = [payload];
-
-    while (queue.length) {
-        const current = queue.shift();
-        if (!current) continue;
-        if (typeof current === 'object') {
-            if (visited.has(current)) continue;
-            visited.add(current);
-        }
-
-        if (isAgentLike(current)) return current;
-
-        if (current && typeof current === 'object') {
-            for (const value of Object.values(current)) {
-                if (value && (typeof value === 'object' || Array.isArray(value))) {
-                    queue.push(value);
-                }
-            }
-        }
-    }
-
-    return null;
-};
-
-const createJsonApiCandidates = (url, page) => {
-    const candidates = new Set();
-
-    try {
-        const parsed = new URL(url);
-        const params = new URLSearchParams(parsed.search);
-        params.set('page', String(page));
-        if (!params.get('pageSize')) params.set('pageSize', String(DEFAULT_PAGE_SIZE));
-
-        const query = params.toString();
-        candidates.add(`${DOMAIN_BASE}/real-estate-agents/api/search?${query}`);
-        candidates.add(`${DOMAIN_BASE}/api/agents/search?${query}`);
-        candidates.add(`${DOMAIN_BASE}/real-estate-agents/api/list?${query}`);
-        candidates.add(`${DOMAIN_BASE}/rea/api/agents/search?${query}`);
-        candidates.add(`${DOMAIN_BASE}/rea/api/agents?${query}`);
-        candidates.add(`${DOMAIN_BASE}/api/agents?${query}`);
-        candidates.add(`${DOMAIN_BASE}/agents/api/list?${query}`);
-    } catch (err) {
-        log.debug(`Failed to build API candidates: ${err.message}`);
-    }
-
-    return Array.from(candidates);
-};
-
-const fetchAgentsViaJsonApi = async ({ url, page, proxyConfiguration }) => {
-    const pageUrl = withPageParams(url, page);
-    const apiCandidates = createJsonApiCandidates(pageUrl, page);
-    for (const apiUrl of apiCandidates) {
-        try {
-            const response = await gotScraping({
-                url: apiUrl,
-                headers: createStealthHeaders(),
-                responseType: 'text',
-                proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-                retry: {
-                    limit: 1,
-                    statusCodes: [408, 429, 500, 502, 503, 504],
-                },
-                timeout: { request: PAGE_REQUEST_TIMEOUT_MS },
-            });
-
-            const payload = safeJsonParse(response.body);
-            if (!payload) continue;
-
-            const extracted = extractAgentsFromJsonPayload({
-                payload,
-                sourceUrl: url,
-                currentPage: page,
-            });
-
-            if (extracted.agents.length > 0) {
-                log.debug(`JSON API succeeded via ${apiUrl} with ${extracted.agents.length} agents`);
-                return { ...extracted, apiUrl, agents: extracted.agents.map(addMetadata) };
-            }
-        } catch (err) {
-            log.debug(`JSON API candidate failed (${apiUrl}): ${err.message}`);
-            if (err?.response?.statusCode === 403) {
-                log.warning(`JSON API blocked with 403 at ${apiUrl}`);
-            }
-        }
-    }
-
-    return { agents: [], nextPage: null, totalResults: null };
-};
-
 const addMetadata = (agent) => {
     if (!agent) return agent;
     agent.scrapedAt = agent.scrapedAt || new Date().toISOString();
@@ -538,34 +411,21 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
     try {
         log.debug(`Scraping agent listing page: ${url}`);
 
-        // First try the JSON API route (fastest and cheapest)
-        if (!html) {
-            const apiResult = await fetchAgentsViaJsonApi({
-                url,
-                page: currentPage,
-                proxyConfiguration,
-            });
-            if (apiResult.agents.length > 0) {
-                return apiResult;
-            }
-        }
-        
-        const targetUrl = withPageParams(url, currentPage);
         let pageHtml = html;
-        
+
         if (!pageHtml) {
             const headers = createStealthHeaders();
 
             const response = await gotScraping({
-                url: targetUrl,
+                url,
                 headers,
                 proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
                 responseType: 'text',
                 retry: {
-                    limit: 3,
+                    limit: 2,
                     statusCodes: [408, 429, 500, 502, 503, 504],
                 },
-                timeout: { request: PAGE_REQUEST_TIMEOUT_MS },
+                timeout: { request: 15000 },
             });
 
             pageHtml = response.body;
@@ -591,38 +451,21 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
             }
         }
 
-        // Validate we got HTML content
         if (pageHtml.includes('403 Forbidden') || pageHtml.length < 1000) {
             log.warning('Possible blocking or incomplete page received');
         }
 
-        // Parse agent cards from HTML - multiple selector strategies
         let agentCards = [];
-        
-        // Strategy 1: data-testid selectors (newer Domain interface)
-        agentCards = $([
-            '[data-testid*="agent-card"]',
-            '[data-testid*="agent-card-wrapper"]',
-            '[data-testid*="agent-tile"]',
-            '[data-testid*="agentProfile"]',
-            '[data-testid*="agent-list-item"]',
-        ].join(',')).toArray();
+        agentCards = [
+            ...$('[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], [data-testid*="agent-list-item"]').toArray(),
+        ];
         log.debug(`[Strategy 1] Found ${agentCards.length} cards with data-testid patterns`);
-        
-        // Strategy 2: Try class-based selectors (common pattern)
+
         if (agentCards.length === 0) {
-            agentCards = $([
-                'article.agent-card',
-                'article[class*="agent"]',
-                'div[class*="agent-card"]',
-                'div[class*="agent-tile"]',
-                'div[class*="agent-profile"]',
-                'li[class*="agent"]',
-            ].join(',')).toArray();
+            agentCards = $('article.agent-card, article[class*="agent"], div[class*="agent-card"], div[class*="agent-profile"], li[class*="agent"]').toArray();
             log.debug(`[Strategy 2] Found ${agentCards.length} cards with class selectors`);
         }
-        
-        // Strategy 3: Try generic container selectors
+
         if (agentCards.length === 0) {
             agentCards = $('article, li, div[class*="card"]').toArray().filter((el) => {
                 const text = $(el).text().toLowerCase();
@@ -635,7 +478,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
             log.warning('No agent cards found with any selector strategy');
             log.debug(`Page HTML sample: ${pageHtml.substring(0, 500)}`);
         }
-        
+
         if (agentCards.length > MAX_CARD_PARSE) {
             agentCards = agentCards.slice(0, MAX_CARD_PARSE);
         }
@@ -643,112 +486,67 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
         for (const card of agentCards) {
             try {
                 const $card = $(card);
-                
-                const agent = {};
-                
-                // Extract URL - pick the most likely agent link
+
                 const hrefs = $card
                     .find('a[href]')
                     .map((_, el) => $(el).attr('href'))
                     .get();
                 const agentHref = pickAgentHref(hrefs);
-                agent.url = ensureAbsoluteUrl(agentHref);
+                const agentUrl = ensureAbsoluteUrl(agentHref);
 
-                if (!isLikelyAgentUrl(agent.url)) {
-                    log.debug('Skipping card: no valid agent URL found');
+                if (!isLikelyAgentUrl(agentUrl)) {
                     continue;
                 }
 
-                // Extract ID from URL (if present)
+                let nameText = cleanText($card.find('h3.css-1hakis5, [data-testid*="name"], [data-testid*="agent-name"], .agent-name, h2, h3, .title').first().text());
+                if (!nameText) nameText = cleanText($card.find('a').first().text());
+                if (!nameText || /find agents?/i.test(nameText)) continue;
+
+                const agent = {
+                    id: null,
+                    url: agentUrl,
+                    name: nameText,
+                    title: cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text()),
+                    agency: cleanText($card.find('[data-testid*="agency"], .agency-name, [class*="agency"], [class*="company"]').first().text()),
+                    agencyUrl: ensureAbsoluteUrl($card.find('a[href*="agency"], a[href*="agencies"]').first().attr('href')) || null,
+                    phone: extractPhoneNumber(
+                        $card.find('a[href^="tel:"], [data-testid*="phone"], .phone').first().text() ||
+                        $card.find('a[href^="tel:"]').attr('href') || ''
+                    ),
+                    email: extractEmail(
+                        $card.find('a[href^="mailto:"], [data-testid*="email"], .email').first().text() ||
+                        $card.find('a[href^="mailto:"]').attr('href') || ''
+                    ),
+                    suburb: cleanText($card.find('[class*="suburb"], [class*="location"], [class*="address"]').first().text()),
+                    profileImage: $card.find('img[data-testid*="agent"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
+                    agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first().attr('src') || null,
+                    currentListings: cleanText($card.find('[class*="listing"], [data-testid*="listing"]').first().text()),
+                    soldProperties: cleanText($card.find('[class*="sold"], [data-testid*="sold"]').first().text()),
+                    rating: cleanText($card.find('[data-rating], .rating, .stars').first().attr('data-rating') || $card.find('.rating, .stars').first().text()),
+                    source: DOMAIN_BASE,
+                    scrapedAt: new Date().toISOString(),
+                };
+
                 const idMatch = agent.url?.match(/(\d{6,})(?:[/?#]|$)/);
                 agent.id = idMatch ? idMatch[1] : null;
 
-                // Extract agent name - Strategy: Try multiple selectors
-                let nameText = cleanText($card.find('[data-testid*="name"], [data-testid*="agent-name"], h2, h3, [class*="name"]').first().text());
-                if (!nameText) nameText = cleanText($card.find('a').first().text());
-                agent.name = nameText || null;
-                if (!agent.name || /find agents?/i.test(agent.name)) {
-                    log.debug('Skipping card: missing/invalid name');
-                    continue;
-                }
-
-                // Extract title/position
-                const titleText = cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text());
-                agent.title = titleText || null;
-
-                // Extract agency name
-                const agencyText = cleanText($card.find('[data-testid*="agency"], [class*="agency"], [class*="company"]').first().text());
-                agent.agency = agencyText || null;
-
-                // Extract agency URL
-                const agencyLink = $card.find('a[href*="agency"], a[href*="agencies"]').first();
-                agent.agencyUrl = ensureAbsoluteUrl(agencyLink.attr('href')) || null;
-
-                // Extract phone number
-                const phoneText = $card.find('[data-testid*="phone"], [class*="phone"], a[href^="tel:"]').first().text() || 
-                                 $card.find('a[href^="tel:"]').attr('href') || '';
-                agent.phone = extractPhoneNumber(phoneText) || null;
-
-                // Extract email
-                const emailText = $card.find('[data-testid*="email"], [class*="email"], a[href^="mailto:"]').first().text() || 
-                                 $card.find('a[href^="mailto:"]').attr('href') || '';
-                agent.email = extractEmail(emailText) || null;
-
-                // Extract suburb/location
-                const suburbText = cleanText($card.find('[class*="suburb"], [class*="location"], [class*="address"]').first().text());
-                agent.suburb = suburbText || null;
-
-                // Extract profile image
-                const imgElem = $card.find('img[data-testid*="agent"], img[src*="domain"], img[src*="cloudinary"], img[alt*="agent"], img[alt*="Agent"]').first();
-                agent.profileImage = imgElem.attr('src') || imgElem.attr('data-src') || null;
-
-                // Extract agency logo
-                const logoElem = $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first();
-                agent.agencyLogo = logoElem.attr('src') || logoElem.attr('data-src') || null;
-
-                // Extract current listings count
-                const listingsText = $card.find('[class*="listings"], [data-testid*="listings"]').text();
-                const listingsMatch = listingsText.match(/(\d+)/);
-                agent.currentListings = listingsMatch ? parseInt(listingsMatch[1], 10) : null;
-
-                // Extract sold properties count
-                const soldText = $card.find('[class*="sold"], [data-testid*="sold"]').text();
-                const soldMatch = soldText.match(/(\d+)/);
-                agent.soldProperties = soldMatch ? parseInt(soldMatch[1], 10) : null;
-
-                // Extract rating
-                const ratingText = $card.find('[class*="rating"], [data-testid*="rating"]').text();
-                const ratingMatch = ratingText.match(/([\d.]+)/);
-                agent.rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-
-                // Extract review count
-                const reviewText = $card.find('[class*="review"], [data-testid*="review"]').text();
-                const reviewMatch = reviewText.match(/(\d+)/);
-                agent.reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : null;
-
                 agents.push(addMetadata(agent));
-                log.debug(`Extracted agent: ${agent.name} - ${agent.agency}`);
-                
             } catch (err) {
                 log.warning(`Failed to parse agent card: ${err.message}`);
             }
         }
 
-        // Try to find pagination info
         let nextPageLink = $('a[aria-label="Go to next page"]').attr('href');
         if (!nextPageLink) nextPageLink = $('a[rel="next"]').attr('href');
+        if (!nextPageLink) nextPageLink = $('a[aria-label*="Next"]').attr('href');
 
-        const totalResultsText = cleanText($('[data-testid="summary-header-total-results"], [class*="total-results"]').text());
+        const totalResultsText = cleanText($('[data-testid*="total"], [class*="total-results"]').first().text());
         const totalMatch = totalResultsText?.match(/([\d,]+)/);
         if (totalMatch) totalResults = totalResults || parseInt(totalMatch[1].replace(/,/g, ''), 10);
 
-        const nextPage = ensureAbsoluteUrl(nextPageCandidate || nextPageLink) || deriveNextPageUrl({ url: targetUrl, currentPage });
+        const nextPage = ensureAbsoluteUrl(nextPageCandidate || nextPageLink) || deriveNextPageUrl({ url, currentPage });
 
-        return {
-            agents,
-            nextPage,
-            totalResults,
-        };
+        return { agents, nextPage, totalResults };
     } catch (error) {
         log.error(`Failed to scrape agent listing page: ${error.message}`);
         return { agents: [], nextPage: null, totalResults: null };
@@ -761,12 +559,10 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
 
 const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 }) => {
     let browser;
-    let context;
-    
+
     try {
-        const targetUrl = withPageParams(url, currentPage);
-        log.debug(`Scraping via Playwright: ${targetUrl}`);
-        
+        log.debug(`Scraping via Playwright: ${url}`);
+
         const launchOptions = {
             headless: true,
             args: [
@@ -784,57 +580,21 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         }
 
         browser = await chromium.launch(launchOptions);
-        context = await browser.newContext({
+        const context = await browser.newContext({
             userAgent: getRandomUserAgent(),
             viewport: { width: 1920, height: 1080 },
             locale: 'en-AU',
-            ignoreHTTPSErrors: true,
-            extraHTTPHeaders: createStealthHeaders(),
         });
 
         const page = await context.newPage();
-        page.setDefaultNavigationTimeout(PLAYWRIGHT_NAV_TIMEOUT_MS);
-        page.setDefaultTimeout(PLAYWRIGHT_NAV_TIMEOUT_MS);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT_MS });
 
-        // Navigate to page
-        let navigated = false;
         try {
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
-            navigated = true;
-        } catch (err) {
-            log.warning(`Playwright goto domcontentloaded failed: ${err.message}`);
+            await page.waitForSelector('h3.css-1hakis5, [data-testid*="agent"]', { timeout: PLAYWRIGHT_TIMEOUT_MS });
+        } catch (e) {
+            log.warning('Timeout waiting for agent cards, continuing anyway');
         }
 
-        if (!navigated) {
-            try {
-                await page.goto(targetUrl, { waitUntil: 'commit', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
-                navigated = true;
-            } catch (err) {
-                log.warning(`Playwright goto commit failed: ${err.message}`);
-            }
-        }
-
-        // Accept cookie/consent if present
-        try {
-            const acceptBtn = await page.waitForSelector('button:has-text("Accept"), button:has-text("Got it"), [aria-label*="accept"]', { timeout: 5000 });
-            if (acceptBtn) await acceptBtn.click({ delay: 50 });
-        } catch (_) {
-            // ignore
-        }
-
-        // Wait for content to load
-        if (navigated) {
-            try {
-                await page.waitForSelector(
-                    '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], article[class*="agent"], div[class*="agent-card"]',
-                    { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS },
-                );
-            } catch (e) {
-                log.warning('Timeout waiting for agent cards, continuing anyway');
-            }
-        }
-        
-        // Scroll to load lazy images
         await page.evaluate(async () => {
             await new Promise((resolve) => {
                 let totalHeight = 0;
@@ -852,34 +612,17 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
             });
         });
 
-        let html = null;
-        if (navigated) {
-            html = await page.content();
-        } else {
-            try {
-                const response = await context.request.get(targetUrl, { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
-                if (response.ok()) {
-                    html = await response.text();
-                }
-            } catch (err) {
-                log.warning(`Playwright request fallback failed: ${err.message}`);
-            }
-        }
-        
+        const html = await page.content();
         await browser.close();
 
-        // Parse with cheerio
-        if (!html) {
-            return { agents: [], nextPage: null, totalResults: null };
-        }
-        return await scrapeAgentListingPage({ url: targetUrl, proxyConfiguration, html, currentPage });
+        return await scrapeAgentListingPage({ url, proxyConfiguration, html, currentPage });
     } catch (error) {
         log.error(`Playwright scraping failed: ${error.message}`);
         if (browser) {
             try {
                 await browser.close();
-            } catch (e) {
-                // Ignore
+            } catch (_) {
+                // ignore
             }
         }
         return { agents: [], nextPage: null, totalResults: null };
@@ -893,208 +636,47 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
 const scrapeAgentDetails = async ({ url, proxyConfiguration }) => {
     try {
         log.debug(`Scraping agent details: ${url}`);
-        
+
         const headers = createStealthHeaders();
-
-        let response = null;
-        let lastError = null;
-        const maxAttempts = 2;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                response = await gotScraping({
-                    url,
-                    headers,
-                    proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-                    responseType: 'text',
-                    retry: {
-                        limit: 1,
-                        statusCodes: [408, 429, 500, 502, 503, 504],
-                    },
-                    timeout: { request: 20000 },
-                });
-                break;
-            } catch (err) {
-                lastError = err;
-                log.debug(`Detail request failed (attempt ${attempt}/${maxAttempts}): ${err.message}`);
-            }
-        }
-
-        if (!response) {
-            const message = lastError ? lastError.message : 'Detail request failed';
-            throw new Error(message);
-        }
+        const response = await gotScraping({
+            url,
+            headers,
+            proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
+            responseType: 'text',
+            retry: {
+                limit: 1,
+                statusCodes: [408, 429, 500, 502, 503, 504],
+            },
+            timeout: { request: 20000 },
+        });
 
         const $ = cheerioLoad(response.body);
         const details = {};
 
-        // Extract JSON-LD first
         const jsonLdData = extractJsonLd(response.body);
         const jsonLdAgent = parseJsonLdAgent(jsonLdData);
-        
-        if (jsonLdAgent) {
-            Object.assign(details, jsonLdAgent);
-        }
+        if (jsonLdAgent) Object.assign(details, jsonLdAgent);
 
-        const embeddedState = extractEmbeddedState(response.body);
-        if (embeddedState) {
-            const embeddedDetails = extractAgentsFromJsonPayload({
-                payload: embeddedState,
-                sourceUrl: url,
-                currentPage: 1,
-            });
-            if (embeddedDetails.agents.length > 0) {
-                Object.assign(details, embeddedDetails.agents[0]);
-            } else {
-                const embeddedAgent = findFirstAgentObject(embeddedState);
-                if (embeddedAgent) {
-                    const normalized = normalizeAgentFromJson(embeddedAgent);
-                    if (normalized) Object.assign(details, normalized);
-                }
-            }
-        }
-
-        // Extract full name
         if (!details.name) {
             details.name = cleanText($('[data-testid="agent-profile-name"], h1, [class*="agent-name"]').first().text());
         }
-
-        // Extract title/position
         if (!details.title) {
-            details.title = cleanText($('[data-testid="agent-profile-title"], [class*="agent-title"], [class*="position"]').first().text());
+            details.title = cleanText($('[data-testid="agent-profile-title"], [class*="agent-title"]').first().text());
         }
-
-        // Extract biography/description
-        const bioElem = $('[data-testid="agent-profile-bio"], [data-testid="agent-description"], [class*="biography"], [class*="bio"]');
-        details.biography = cleanText(bioElem.text()) || details.biography;
-
-        // Extract agency information
         if (!details.agency) {
             details.agency = cleanText($('[data-testid="agency-name"], [class*="agency-name"]').first().text());
         }
-
-        // Extract contact information
-        const phoneElem = $('[data-testid="agent-phone"], [class*="phone"], a[href^="tel:"]');
-        if (phoneElem.length && !details.phone) {
-            details.phone = extractPhoneNumber(phoneElem.text() || phoneElem.attr('href'));
+        if (!details.phone) {
+            const phoneText = $('[data-testid="agent-phone"], [class*="phone"], a[href^="tel:"]').first().text();
+            details.phone = extractPhoneNumber(phoneText);
         }
-
-        const mobileElem = $('[data-testid="agent-mobile"], [class*="mobile"]');
-        if (mobileElem.length && !details.mobile) {
-            details.mobile = extractPhoneNumber(mobileElem.text());
+        if (!details.email) {
+            const emailText = $('[data-testid="agent-email"], [class*="email"], a[href^="mailto:"]').first().text();
+            details.email = extractEmail(emailText);
         }
-
-        const emailElem = $('[data-testid="agent-email"], [class*="email"], a[href^="mailto:"]');
-        if (emailElem.length && !details.email) {
-            details.email = extractEmail(emailElem.text() || emailElem.attr('href'));
-        }
-
-        // Extract address
         if (!details.officeAddress) {
-            details.officeAddress = cleanText($('[data-testid="agent-address"], [class*="office-address"], [class*="address"]').first().text());
+            details.officeAddress = cleanText($('[data-testid="agent-address"], [class*="office-address"]').first().text());
         }
-
-        // Extract suburb, state, postcode
-        if (!details.suburb) {
-            details.suburb = cleanText($('[data-testid="agent-suburb"], [class*="suburb"]').first().text());
-        }
-
-        if (!details.state) {
-            details.state = cleanText($('[data-testid="agent-state"], [class*="state"]').first().text());
-        }
-
-        if (!details.postcode) {
-            const postcodeText = cleanText($('[data-testid="agent-postcode"], [class*="postcode"]').first().text());
-            const postcodeMatch = postcodeText?.match(/\d{4}/);
-            details.postcode = postcodeMatch ? postcodeMatch[0] : null;
-        }
-
-        // Extract specializations
-        const specializationsElem = $('[data-testid="agent-specializations"], [class*="specializations"], [class*="specialties"]');
-        if (specializationsElem.length) {
-            const specs = [];
-            specializationsElem.find('li, span, div').each((_, el) => {
-                const spec = cleanText($(el).text());
-                if (spec && spec.length < 50) specs.push(spec);
-            });
-            if (specs.length > 0) details.specializations = specs;
-        }
-
-        // Extract languages
-        const languagesElem = $('[data-testid="agent-languages"], [class*="languages"]');
-        if (languagesElem.length) {
-            const langs = [];
-            languagesElem.find('li, span').each((_, el) => {
-                const lang = cleanText($(el).text());
-                if (lang) langs.push(lang);
-            });
-            if (langs.length > 0) details.languages = langs;
-        }
-
-        // Extract areas served
-        const areasElem = $('[data-testid="agent-areas"], [class*="areas-served"], [class*="service-areas"]');
-        if (areasElem.length) {
-            const areas = [];
-            areasElem.find('li, span, a').each((_, el) => {
-                const area = cleanText($(el).text());
-                if (area && area.length < 50) areas.push(area);
-            });
-            if (areas.length > 0) details.areasServed = areas;
-        }
-
-        // Extract performance metrics
-        if (!details.currentListings) {
-            const listingsText = $('[data-testid="agent-current-listings"], [class*="current-listings"]').text();
-            const listingsMatch = listingsText.match(/(\d+)/);
-            details.currentListings = listingsMatch ? parseInt(listingsMatch[1], 10) : null;
-        }
-
-        if (!details.soldProperties) {
-            const soldText = $('[data-testid="agent-sold"], [class*="sold-properties"]').text();
-            const soldMatch = soldText.match(/(\d+)/);
-            details.soldProperties = soldMatch ? parseInt(soldMatch[1], 10) : null;
-        }
-
-        if (!details.rentedProperties) {
-            const rentedText = $('[data-testid="agent-rented"], [class*="rented-properties"]').text();
-            const rentedMatch = rentedText.match(/(\d+)/);
-            details.rentedProperties = rentedMatch ? parseInt(rentedMatch[1], 10) : null;
-        }
-
-        // Extract rating and reviews
-        if (!details.rating) {
-            const ratingText = $('[data-testid="agent-rating"], [class*="rating"]').text();
-            const ratingMatch = ratingText.match(/([\d.]+)/);
-            details.rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-        }
-
-        if (!details.reviewCount) {
-            const reviewText = $('[data-testid="agent-reviews"], [class*="review-count"]').text();
-            const reviewMatch = reviewText.match(/(\d+)/);
-            details.reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : null;
-        }
-
-        // Extract profile image
-        if (!details.profileImage) {
-            const profileImg = $('[data-testid="agent-profile-image"], img[alt*="agent"], img[alt*="Agent"]').first();
-            details.profileImage = profileImg.attr('src') || profileImg.attr('data-src') || null;
-        }
-
-        // Extract agency logo
-        if (!details.agencyLogo) {
-            const logoImg = $('img[alt*="logo"], img[alt*="Logo"], [class*="agency-logo"] img').first();
-            details.agencyLogo = logoImg.attr('src') || logoImg.attr('data-src') || null;
-        }
-
-        // Extract years of experience
-        const experienceText = $('[data-testid="agent-experience"], [class*="experience"], [class*="years"]').text();
-        const experienceMatch = experienceText.match(/(\d+)\s*year/i);
-        if (experienceMatch) {
-            details.yearsExperience = parseInt(experienceMatch[1], 10);
-        }
-
-        details.scrapedAt = details.scrapedAt || new Date().toISOString();
-        details.source = details.source || DOMAIN_BASE;
 
         return details;
     } catch (error) {
@@ -1109,9 +691,9 @@ const scrapeAgentDetails = async ({ url, proxyConfiguration }) => {
 
 Actor.main(async () => {
     const input = await Actor.getInput();
-    
+
     const {
-        startUrl = 'https://www.domain.com.au/real-estate-agents/',
+        startUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION),
         maxResults = 50,
         maxPages = 5,
         collectDetails = true,
@@ -1123,19 +705,10 @@ Actor.main(async () => {
         state = null,
         agencyName = null,
         specialization = null,
-    } = input;
+    } = input || {};
 
-    const proxyConfig = await Actor.createProxyConfiguration(
-        proxyConfiguration || { useApifyProxy: true },
-    );
-    if (!proxyConfiguration) {
-        log.warning('Proxy configuration missing. Using Apify proxy by default.');
-    }
+    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
 
-    // ========================================================================
-    // INPUT VALIDATION
-    // ========================================================================
-    
     const validatedMaxResults = Math.max(1, Math.min(maxResults || 50, 1000));
     const validatedMaxPages = Math.max(1, Math.min(maxPages || 5, 50));
     const pageEstimate = Math.ceil(validatedMaxResults / Math.max(20, DEFAULT_PAGE_SIZE));
@@ -1144,60 +717,50 @@ Actor.main(async () => {
         Math.max(
             validatedMaxPages,
             pageEstimate,
-            Math.ceil(validatedMaxResults / 15), // ensure enough pages when dedup/filters drop items
+            Math.ceil(validatedMaxResults / 15),
         ),
     );
-    
+
     if (!startUrl.includes('domain.com.au')) {
         throw new Error('Invalid input: startUrl must be from domain.com.au');
     }
 
-    log.info('Domain.com.au Real Estate Agents Scraper started', { 
-        startUrl, 
-        maxResults: validatedMaxResults, 
+    log.info('Domain.com.au Real Estate Agents Scraper started', {
+        startUrl,
+        maxResults: validatedMaxResults,
         maxPages: pageLimit,
         collectDetails,
     });
 
-    // Build search URL with filters
     let searchUrl = startUrl;
-    
+
     if (location || suburb || state || agencyName || specialization) {
         let baseUrl = DOMAIN_BASE;
-        
-        if (state) {
-            baseUrl = `${DOMAIN_BASE}/real-estate-agents/${state.toLowerCase()}/`;
-        } else if (location) {
-            baseUrl = `${DOMAIN_BASE}/real-estate-agents/${location.toLowerCase().replace(/\s+/g, '-')}/`;
+
+        if (location) {
+            baseUrl = buildAgentLocationUrl(location.toLowerCase().replace(/\s+/g, '-'));
         } else if (suburb) {
-            baseUrl = `${DOMAIN_BASE}/real-estate-agents/${suburb.toLowerCase().replace(/\s+/g, '-')}/`;
+            baseUrl = buildAgentLocationUrl(suburb.toLowerCase().replace(/\s+/g, '-'));
+        } else if (state) {
+            baseUrl = buildAgentLocationUrl(state.toLowerCase().replace(/\s+/g, '-'));
         } else {
-            baseUrl = `${DOMAIN_BASE}/real-estate-agents/`;
+            baseUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
         }
-        
+
         const params = new URLSearchParams();
-        
-        if (agencyName) {
-            params.append('agency', agencyName);
-        }
-        
-        if (specialization) {
-            params.append('specialization', specialization);
-        }
-        
+        if (agencyName) params.append('agency', agencyName);
+        if (specialization) params.append('specialization', specialization);
+
         const queryString = params.toString();
         searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
     }
 
-    searchUrl = withPageParams(searchUrl, 1);
     if (isRootAgentSearchUrl(searchUrl)) {
-        const fallbackSlug = DEFAULT_AGENT_LOCATION_FALLBACKS[0];
-        searchUrl = buildAgentLocationUrl(fallbackSlug);
-        log.warning(`Root search has no listings. Using default location: ${fallbackSlug}`);
+        searchUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
+        log.warning(`Root search has no listings. Using default location: ${DEFAULT_AGENT_LOCATION}`);
     }
 
     log.info(`Final search URL: ${searchUrl}`);
-    let isRootSearch = isRootAgentSearchUrl(searchUrl);
 
     const allAgents = [];
     const seenIds = new Set();
@@ -1205,13 +768,10 @@ Actor.main(async () => {
     let nextPageUrl = searchUrl;
     let totalResultsCount = null;
     const datasetPusher = createDatasetPusher(DATASET_BATCH_SIZE);
-    const maxDetailConcurrency = Math.max(1, Math.min(maxConcurrency || 3, 10));
-    const detailLimiter = collectDetails ? createConcurrencyLimiter(maxDetailConcurrency) : null;
+    const detailLimiter = collectDetails ? createConcurrencyLimiter(Math.max(1, Math.min(maxConcurrency || 3, 10))) : null;
     const detailTasks = [];
     let detailsCollected = 0;
-    const enablePlaywright = Boolean(usePlaywright);
 
-    // Scraping loop
     while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
         log.info(
             `Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`,
@@ -1224,8 +784,7 @@ Actor.main(async () => {
             currentPage,
         });
 
-        const needBrowser = (ENABLE_BROWSER_FALLBACK || enablePlaywright) && (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
-        if (needBrowser) {
+        if ((!result || result.agents.length === 0) && (ENABLE_BROWSER_FALLBACK || usePlaywright)) {
             log.info('Attempting Playwright fallback...');
             result = await scrapeViaPlaywright({
                 url: nextPageUrl,
@@ -1234,42 +793,8 @@ Actor.main(async () => {
             });
         }
 
-        if ((!result || result.agents.length === 0) && currentPage === 1 && isRootSearch) {
-            for (const fallbackSlug of DEFAULT_AGENT_LOCATION_FALLBACKS) {
-                const fallbackUrl = withPageParams(buildAgentLocationUrl(fallbackSlug), 1);
-                log.warning(`No agents on root search. Trying fallback location: ${fallbackSlug}`);
-                let fallbackResult = await scrapeAgentListingPage({
-                    url: fallbackUrl,
-                    proxyConfiguration: proxyConfig,
-                    currentPage: 1,
-                });
-
-                const fallbackNeedBrowser =
-                    ENABLE_BROWSER_FALLBACK &&
-                    (!fallbackResult || fallbackResult.agents.length === 0 || fallbackResult.agents.length < 3);
-                if (fallbackNeedBrowser) {
-                    log.info('Attempting Playwright fallback on location page...');
-                    fallbackResult = await scrapeViaPlaywright({
-                        url: fallbackUrl,
-                        proxyConfiguration: proxyConfig,
-                        currentPage: 1,
-                    });
-                }
-
-                if (fallbackResult && fallbackResult.agents.length > 0) {
-                    result = fallbackResult;
-                    nextPageUrl = fallbackUrl;
-                    isRootSearch = false;
-                    break;
-                }
-            }
-        }
-
         if (!result || result.agents.length === 0) {
             log.warning(`No agents found on page ${currentPage}, stopping pagination`);
-            if (currentPage === 1) {
-                throw new Error('No agents found on first page. Likely blocked or DOM shape changed.');
-            }
             break;
         }
 
@@ -1282,7 +807,6 @@ Actor.main(async () => {
             log.info(`Total available: ${totalResultsCount} agents`);
         }
 
-        // Deduplicate and add agents
         let addedThisPage = 0;
         const newItemsThisPage = [];
         for (const agent of result.agents) {
@@ -1331,7 +855,6 @@ Actor.main(async () => {
         nextPageUrl = result.nextPage;
         currentPage++;
 
-        // Rate limiting: human-like delays
         if (nextPageUrl && allAgents.length < validatedMaxResults) {
             const delay = 500 + Math.random() * 900;
             log.debug(`Rate limiting: ${Math.round(delay)}ms before next page`);
@@ -1348,7 +871,6 @@ Actor.main(async () => {
         await datasetPusher.flush();
     }
 
-    // Final report
     log.info('='.repeat(70));
     log.info('SCRAPING COMPLETED SUCCESSFULLY');
     log.info('='.repeat(70));
@@ -1369,10 +891,10 @@ function createConcurrencyLimiter(maxConcurrency) {
 
     const next = () => {
         if (active >= maxConcurrency || queue.length === 0) return;
-        
+
         active++;
         const { task, resolve, reject } = queue.shift();
-        
+
         task()
             .then(resolve)
             .catch(reject)

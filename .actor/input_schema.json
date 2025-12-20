@@ -1,0 +1,89 @@
+{
+  "title": "Domain.com.au Real Estate Agents Scraper",
+  "description": "Extract Australian real estate agent profiles from Domain.com.au with comprehensive contact details, agency information, and performance metrics",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Search URL",
+      "type": "string",
+      "description": "Domain.com.au real estate agents search URL to scrape from. Default searches all agents across Australia.",
+      "editor": "textfield",
+      "example": "https://www.domain.com.au/real-estate-agents/",
+      "default": "https://www.domain.com.au/real-estate-agents/",
+      "prefill": "https://www.domain.com.au/real-estate-agents/"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Specific location to search (e.g., 'sydney-nsw', 'melbourne-vic', 'brisbane-qld'). Leave empty to use startUrl.",
+      "editor": "textfield",
+      "example": "sydney-nsw"
+    },
+    "suburb": {
+      "title": "Suburb",
+      "type": "string",
+      "description": "Specific suburb to filter agents by area of operation.",
+      "editor": "textfield",
+      "example": "paddington"
+    },
+    "state": {
+      "title": "State",
+      "type": "string",
+      "description": "Australian state to search in (nsw, vic, qld, wa, sa, tas, act, nt).",
+      "editor": "select",
+      "enum": ["nsw", "vic", "qld", "wa", "sa", "tas", "act", "nt"],
+      "enumTitles": ["New South Wales", "Victoria", "Queensland", "Western Australia", "South Australia", "Tasmania", "Australian Capital Territory", "Northern Territory"]
+    },
+    "agencyName": {
+      "title": "Agency Name",
+      "type": "string",
+      "description": "Filter by specific real estate agency name (e.g., 'Ray White', 'LJ Hooker').",
+      "editor": "textfield",
+      "example": "Ray White"
+    },
+    "specialization": {
+      "title": "Specialization",
+      "type": "string",
+      "description": "Filter by agent specialization or property type focus.",
+      "editor": "select",
+      "enum": ["residential", "commercial", "rural", "prestige", "rental"],
+      "enumTitles": ["Residential", "Commercial", "Rural", "Prestige/Luxury", "Rental/Property Management"]
+    },
+    "collectDetails": {
+      "title": "Collect Full Agent Details",
+      "type": "boolean",
+      "description": "Visit each agent profile page to extract complete biography, contact info, performance metrics, and additional information. Increases runtime but provides comprehensive data.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "maxResults": {
+      "title": "Maximum Agents",
+      "type": "integer",
+      "description": "Maximum number of agent profiles to collect (1-1000).",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 50,
+      "editor": "number"
+    },
+    "maxPages": {
+      "title": "Maximum Pages",
+      "type": "integer",
+      "description": "Maximum number of result pages to process (each page typically contains 20-30 agents).",
+      "minimum": 1,
+      "maximum": 50,
+      "editor": "number",
+      "default": 3
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Proxy settings for requests. Residential proxies strongly recommended to avoid blocking.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true
+      }
+    }
+  },
+  "required": []
+}

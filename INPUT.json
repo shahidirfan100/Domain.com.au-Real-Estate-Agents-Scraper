@@ -1,0 +1,9 @@
+{
+  "startUrl": "https://www.domain.com.au/real-estate-agents/",
+  "maxResults": 10,
+  "maxPages": 1,
+  "collectDetails": true,
+  "proxyConfiguration": {
+    "useApifyProxy": true
+  }
+}

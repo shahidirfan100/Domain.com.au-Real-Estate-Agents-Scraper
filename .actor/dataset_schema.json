@@ -1,0 +1,296 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "name",
+          "title",
+          "agency",
+          "suburb",
+          "state",
+          "phone",
+          "email",
+          "currentListings",
+          "soldProperties",
+          "rating",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Agent Name",
+            "format": "text"
+          },
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "agency": {
+            "label": "Agency",
+            "format": "text"
+          },
+          "suburb": {
+            "label": "Suburb",
+            "format": "text"
+          },
+          "state": {
+            "label": "State",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "email": {
+            "label": "Email",
+            "format": "text"
+          },
+          "currentListings": {
+            "label": "Current Listings",
+            "format": "text"
+          },
+          "soldProperties": {
+            "label": "Sold",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "text"
+          },
+          "url": {
+            "label": "View Profile",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "full": {
+      "title": "Full Details",
+      "transformation": {
+        "fields": [
+          "id",
+          "name",
+          "firstName",
+          "lastName",
+          "title",
+          "agency",
+          "agencyUrl",
+          "phone",
+          "mobile",
+          "email",
+          "officeAddress",
+          "suburb",
+          "state",
+          "postcode",
+          "profileImage",
+          "agencyLogo",
+          "biography",
+          "specializations",
+          "languages",
+          "areasServed",
+          "yearsExperience",
+          "currentListings",
+          "soldProperties",
+          "rentedProperties",
+          "rating",
+          "reviewCount",
+          "url",
+          "scrapedAt"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Agent Name",
+            "format": "text"
+          },
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "agency": {
+            "label": "Agency",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "mobile": {
+            "label": "Mobile",
+            "format": "text"
+          },
+          "email": {
+            "label": "Email",
+            "format": "text"
+          },
+          "officeAddress": {
+            "label": "Office Address",
+            "format": "text"
+          },
+          "suburb": {
+            "label": "Suburb",
+            "format": "text"
+          },
+          "state": {
+            "label": "State",
+            "format": "text"
+          },
+          "biography": {
+            "label": "Biography",
+            "format": "text"
+          },
+          "specializations": {
+            "label": "Specializations",
+            "format": "text"
+          },
+          "currentListings": {
+            "label": "Current Listings",
+            "format": "text"
+          },
+          "soldProperties": {
+            "label": "Sold Properties",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "text"
+          },
+          "reviewCount": {
+            "label": "Reviews",
+            "format": "text"
+          },
+          "url": {
+            "label": "View Profile",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "contact": {
+      "title": "Contact Information",
+      "transformation": {
+        "fields": [
+          "name",
+          "agency",
+          "phone",
+          "mobile",
+          "email",
+          "officeAddress",
+          "suburb",
+          "state",
+          "postcode",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Agent Name",
+            "format": "text"
+          },
+          "agency": {
+            "label": "Agency",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "mobile": {
+            "label": "Mobile",
+            "format": "text"
+          },
+          "email": {
+            "label": "Email",
+            "format": "text"
+          },
+          "officeAddress": {
+            "label": "Office Address",
+            "format": "text"
+          },
+          "suburb": {
+            "label": "Suburb",
+            "format": "text"
+          },
+          "state": {
+            "label": "State",
+            "format": "text"
+          },
+          "postcode": {
+            "label": "Postcode",
+            "format": "text"
+          },
+          "url": {
+            "label": "Profile URL",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "performance": {
+      "title": "Performance Metrics",
+      "transformation": {
+        "fields": [
+          "name",
+          "agency",
+          "currentListings",
+          "soldProperties",
+          "rentedProperties",
+          "rating",
+          "reviewCount",
+          "yearsExperience",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Agent Name",
+            "format": "text"
+          },
+          "agency": {
+            "label": "Agency",
+            "format": "text"
+          },
+          "currentListings": {
+            "label": "Current Listings",
+            "format": "text"
+          },
+          "soldProperties": {
+            "label": "Sold Properties",
+            "format": "text"
+          },
+          "rentedProperties": {
+            "label": "Rented Properties",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "text"
+          },
+          "reviewCount": {
+            "label": "Number of Reviews",
+            "format": "text"
+          },
+          "yearsExperience": {
+            "label": "Years Experience",
+            "format": "text"
+          },
+          "url": {
+            "label": "View Profile",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}

@@ -8,7 +8,19 @@ import { load as cheerioLoad } from 'cheerio';
 // ============================================================================
 
 const DOMAIN_BASE = 'https://www.domain.com.au';
-const DEFAULT_AGENT_LOCATION = 'perth-wa-6000';
+const DEFAULT_AGENT_LOCATION = 'sydney-nsw-2000';
+
+// State capitals with postcodes - Domain.com.au requires suburb-state-postcode format
+const STATE_CAPITALS = {
+    nsw: 'sydney-nsw-2000',
+    vic: 'melbourne-vic-3000',
+    qld: 'brisbane-qld-4000',
+    wa: 'perth-wa-6000',
+    sa: 'adelaide-sa-5000',
+    tas: 'hobart-tas-7000',
+    act: 'canberra-act-2600',
+    nt: 'darwin-nt-0800',
+};
 
 // Rotate through multiple realistic user agents
 const USER_AGENTS = [
@@ -1312,21 +1324,37 @@ Actor.main(async () => {
         collectDetails,
     });
 
-    // Build search URL
+    // Build search URL - location options override startUrl if provided
     let searchUrl = startUrl;
 
-    if (location || suburb || state || agencyName || specialization) {
-        let baseUrl = DOMAIN_BASE;
+    // Check if user provided location-based filters
+    const hasLocationFilters = location || suburb || state;
+    const hasOtherFilters = agencyName || specialization;
+
+    // If any location filter is set, build URL from that (ignoring startUrl)
+    if (hasLocationFilters || hasOtherFilters) {
+        let locationSlug = null;
 
         if (location) {
-            baseUrl = buildAgentLocationUrl(location.toLowerCase().replace(/\s+/g, '-'));
+            // User provided full location slug (e.g., "sydney-nsw-2000")
+            locationSlug = location.toLowerCase().replace(/\s+/g, '-');
+            log.info(`Using provided location: ${locationSlug}`);
         } else if (suburb) {
-            baseUrl = buildAgentLocationUrl(suburb.toLowerCase().replace(/\s+/g, '-'));
+            // User provided suburb with postcode (e.g., "paddington-nsw-2021")
+            locationSlug = suburb.toLowerCase().replace(/\s+/g, '-');
+            log.info(`Using provided suburb: ${locationSlug}`);
         } else if (state) {
-            baseUrl = buildAgentLocationUrl(state.toLowerCase().replace(/\s+/g, '-'));
+            // User only provided state - use state capital with postcode
+            const stateKey = state.toLowerCase();
+            locationSlug = STATE_CAPITALS[stateKey] || DEFAULT_AGENT_LOCATION;
+            log.info(`Using state capital for ${state.toUpperCase()}: ${locationSlug}`);
         } else {
-            baseUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
+            // No location but has other filters - use default location
+            locationSlug = DEFAULT_AGENT_LOCATION;
+            log.info(`Using default location: ${locationSlug}`);
         }
+
+        const baseUrl = buildAgentLocationUrl(locationSlug);
 
         const params = new URLSearchParams();
         if (agencyName) params.append('agency', agencyName);
@@ -1336,9 +1364,10 @@ Actor.main(async () => {
         searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
     }
 
+    // Ensure we don't use root agent URL which returns no results
     if (isRootAgentSearchUrl(searchUrl)) {
         searchUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
-        log.warning(`Root search has no listings. Using default location: ${DEFAULT_AGENT_LOCATION}`);
+        log.warning(`Root search URL detected. Using default location: ${DEFAULT_AGENT_LOCATION}`);
     }
 
     log.info(`Final search URL: ${searchUrl}`);

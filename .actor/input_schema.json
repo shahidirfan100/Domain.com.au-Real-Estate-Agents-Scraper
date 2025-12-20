@@ -7,33 +7,51 @@
     "startUrl": {
       "title": "Search URL",
       "type": "string",
-      "description": "Domain.com.au real estate agents search URL to scrape from. Default searches all agents across Australia.",
+      "description": "Domain.com.au real estate agents search URL. Must include location with postcode (e.g., sydney-nsw-2000).",
       "editor": "textfield",
-      "example": "https://www.domain.com.au/real-estate-agents/",
-      "default": "https://www.domain.com.au/real-estate-agents/",
-      "prefill": "https://www.domain.com.au/real-estate-agents/"
+      "example": "https://www.domain.com.au/real-estate-agents/sydney-nsw-2000/",
+      "default": "https://www.domain.com.au/real-estate-agents/sydney-nsw-2000/",
+      "prefill": "https://www.domain.com.au/real-estate-agents/sydney-nsw-2000/"
     },
     "location": {
       "title": "Location",
       "type": "string",
-      "description": "Specific location to search (e.g., 'sydney-nsw', 'melbourne-vic', 'brisbane-qld'). Leave empty to use startUrl.",
+      "description": "Location slug including postcode (e.g., 'sydney-nsw-2000', 'melbourne-vic-3000', 'brisbane-qld-4000'). Must include suburb, state, and postcode for results.",
       "editor": "textfield",
-      "example": "sydney-nsw"
+      "example": "sydney-nsw-2000"
     },
     "suburb": {
-      "title": "Suburb",
+      "title": "Suburb with Postcode",
       "type": "string",
-      "description": "Specific suburb to filter agents by area of operation.",
+      "description": "Suburb with state and postcode (e.g., 'paddington-nsw-2021'). Alternative to location field.",
       "editor": "textfield",
-      "example": "paddington"
+      "example": "paddington-nsw-2021"
     },
     "state": {
-      "title": "State",
+      "title": "State Capital",
       "type": "string",
-      "description": "Australian state to search in (nsw, vic, qld, wa, sa, tas, act, nt).",
+      "description": "Australian state - will default to state capital with postcode for search.",
       "editor": "select",
-      "enum": ["nsw", "vic", "qld", "wa", "sa", "tas", "act", "nt"],
-      "enumTitles": ["New South Wales", "Victoria", "Queensland", "Western Australia", "South Australia", "Tasmania", "Australian Capital Territory", "Northern Territory"]
+      "enum": [
+        "nsw",
+        "vic",
+        "qld",
+        "wa",
+        "sa",
+        "tas",
+        "act",
+        "nt"
+      ],
+      "enumTitles": [
+        "New South Wales (Sydney)",
+        "Victoria (Melbourne)",
+        "Queensland (Brisbane)",
+        "Western Australia (Perth)",
+        "South Australia (Adelaide)",
+        "Tasmania (Hobart)",
+        "Australian Capital Territory (Canberra)",
+        "Northern Territory (Darwin)"
+      ]
     },
     "agencyName": {
       "title": "Agency Name",
@@ -47,8 +65,20 @@
       "type": "string",
       "description": "Filter by agent specialization or property type focus.",
       "editor": "select",
-      "enum": ["residential", "commercial", "rural", "prestige", "rental"],
-      "enumTitles": ["Residential", "Commercial", "Rural", "Prestige/Luxury", "Rental/Property Management"]
+      "enum": [
+        "residential",
+        "commercial",
+        "rural",
+        "prestige",
+        "rental"
+      ],
+      "enumTitles": [
+        "Residential",
+        "Commercial",
+        "Rural",
+        "Prestige/Luxury",
+        "Rental/Property Management"
+      ]
     },
     "collectDetails": {
       "title": "Collect Full Agent Details",
@@ -56,13 +86,6 @@
       "description": "Visit each agent profile page to extract complete biography, contact info, performance metrics, and additional information. Increases runtime but provides comprehensive data.",
       "editor": "checkbox",
       "default": true
-    },
-    "usePlaywright": {
-      "title": "Enable Playwright Fallback",
-      "type": "boolean",
-      "description": "Use Playwright when HTML/JSON parsing returns no agents. Slower and more expensive but more resilient.",
-      "editor": "checkbox",
-      "default": false
     },
     "maxResults": {
       "title": "Maximum Agents",

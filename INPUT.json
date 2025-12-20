@@ -1,7 +1,7 @@
 {
-  "startUrl": "https://www.domain.com.au/real-estate-agents/",
-  "maxResults": 10,
-  "maxPages": 1,
+  "startUrl": "https://www.domain.com.au/real-estate-agents/sydney-nsw-2000/",
+  "maxResults": 20,
+  "maxPages": 3,
   "collectDetails": true,
   "proxyConfiguration": {
     "useApifyProxy": true

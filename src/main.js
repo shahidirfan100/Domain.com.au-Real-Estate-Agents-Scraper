@@ -62,14 +62,25 @@ const isLikelyAgentUrl = (url) => {
     if (!url) return false;
     const normalized = ensureAbsoluteUrl(url);
     if (!normalized) return false;
-    if (normalized === DOMAIN_BASE || normalized === `${DOMAIN_BASE}/`) return false;
-
     const lower = normalized.toLowerCase();
-    return (
-        lower.includes('/real-estate-agents/') ||
-        lower.includes('/agent/') ||
-        lower.includes('/agents/')
-    );
+
+    // Drop obvious non-profile URLs
+    if (normalized === DOMAIN_BASE || normalized === `${DOMAIN_BASE}/`) return false;
+    if (lower.includes('/real-estate-agents/') && lower.endsWith('/')) return false; // listing root
+    if (lower.includes('page=')) return false; // paginated listing pages
+
+    // Require a slug-like segment after agents/ or agent/
+    try {
+        const { pathname } = new URL(normalized);
+        const segments = pathname.split('/').filter(Boolean);
+        const hasAgentsSegment = segments.includes('real-estate-agents') || segments.includes('real-estate-agent') || segments.includes('agent') || segments.includes('agents');
+        const last = segments[segments.length - 1] || '';
+        const looksLikeSlug = last.length > 3 && /[a-z]/i.test(last);
+        const hasId = /\d{5,}/.test(last);
+        return hasAgentsSegment && (looksLikeSlug || hasId);
+    } catch (_) {
+        return false;
+    }
 };
 
 const pickAgentHref = (hrefs) => {
@@ -629,6 +640,10 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 let nameText = cleanText($card.find('[data-testid*="name"], [data-testid*="agent-name"], h2, h3, [class*="name"]').first().text());
                 if (!nameText) nameText = cleanText($card.find('a').first().text());
                 agent.name = nameText || null;
+                if (!agent.name || /find agents?/i.test(agent.name)) {
+                    log.debug('Skipping card: missing/invalid name');
+                    continue;
+                }
 
                 // Extract title/position
                 const titleText = cleanText($card.find('[class*="title"], [class*="position"], [class*="role"]').first().text());
@@ -661,7 +676,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.profileImage = imgElem.attr('src') || imgElem.attr('data-src') || null;
 
                 // Extract agency logo
-                const logoElem = $card.find('img[data-testid*=\"agency\"], img[alt*=\"logo\"], img[alt*=\"Logo\"], img[class*=\"logo\"]').first();
+                const logoElem = $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first();
                 agent.agencyLogo = logoElem.attr('src') || logoElem.attr('data-src') || null;
 
                 // Extract current listings count
@@ -1140,7 +1155,8 @@ Actor.main(async () => {
             currentPage,
         });
 
-        if ((!result || result.agents.length === 0) && ENABLE_BROWSER_FALLBACK) {
+        const needBrowser = ENABLE_BROWSER_FALLBACK && (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
+        if (needBrowser) {
             log.info('Attempting Playwright fallback...');
             result = await scrapeViaPlaywright({
                 url: nextPageUrl,

@@ -36,7 +36,8 @@ const STEALTHY_HEADERS = {
 };
 
 const ENABLE_BROWSER_FALLBACK = true;
-const PAGE_REQUEST_TIMEOUT_MS = 15000;
+const PAGE_REQUEST_TIMEOUT_MS = 25000;
+const PLAYWRIGHT_NAV_TIMEOUT_MS = 45000;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -474,6 +475,9 @@ const fetchAgentsViaJsonApi = async ({ url, page, proxyConfiguration }) => {
             }
         } catch (err) {
             log.debug(`JSON API candidate failed (${apiUrl}): ${err.message}`);
+            if (err?.response?.statusCode === 403) {
+                log.warning(`JSON API blocked with 403 at ${apiUrl}`);
+            }
         }
     }
 
@@ -519,7 +523,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
                 responseType: 'text',
                 retry: {
-                    limit: 2,
+                    limit: 3,
                     statusCodes: [408, 429, 500, 502, 503, 504],
                 },
                 timeout: { request: PAGE_REQUEST_TIMEOUT_MS },
@@ -732,13 +736,27 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         });
 
         const page = await context.newPage();
-        
+        await page.setExtraHTTPHeaders({
+            ...STEALTHY_HEADERS,
+            'User-Agent': getRandomUserAgent(),
+        });
+
+        // Lightweight blocking to speed up + reduce detection
+        await page.route('**/*', (route) => {
+            const req = route.request();
+            const type = req.resourceType();
+            if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+                return route.abort();
+            }
+            return route.continue();
+        });
+
         // Navigate to page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+
         // Wait for content to load
         try {
-            await page.waitForSelector('[data-testid*="agent"], .agent-card, [class*="agent"]', { timeout: 30000 });
+            await page.waitForSelector('[data-testid*="agent"], .agent-card, [class*="agent"]', { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
         } catch (e) {
             log.warning('Timeout waiting for agent cards, continuing anyway');
         }
@@ -1116,6 +1134,9 @@ Actor.main(async () => {
 
         if (!result || result.agents.length === 0) {
             log.warning(`No agents found on page ${currentPage}, stopping pagination`);
+            if (currentPage === 1) {
+                throw new Error('No agents found on first page. Likely blocked or DOM shape changed.');
+            }
             break;
         }
 

@@ -9,6 +9,7 @@ import { load as cheerioLoad } from 'cheerio';
 // ============================================================================
 
 const DOMAIN_BASE = 'https://www.domain.com.au';
+const DEFAULT_AGENT_LOCATION_FALLBACKS = ['perth-wa-6000', 'sydney-nsw', 'melbourne-vic'];
 
 // Stealthy User Agents rotation
 const USER_AGENTS = [
@@ -58,25 +59,44 @@ const ensureAbsoluteUrl = (url) => {
     return `${DOMAIN_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
 };
 
+const buildAgentLocationUrl = (slug) => `${DOMAIN_BASE}/real-estate-agents/${slug}/`;
+
+const isRootAgentSearchUrl = (url) => {
+    try {
+        const parsed = new URL(url);
+        const normalizedPath = parsed.pathname.replace(/\/+$/, '/');
+        return normalizedPath === '/real-estate-agents/';
+    } catch (_) {
+        return false;
+    }
+};
+
+const LOCATION_SLUG_REGEX = /-(nsw|vic|qld|wa|sa|tas|act|nt)(-\d{4})?$/i;
+
 const isLikelyAgentUrl = (url) => {
     if (!url) return false;
     const normalized = ensureAbsoluteUrl(url);
     if (!normalized) return false;
-    const lower = normalized.toLowerCase();
-
-    // Drop obvious non-profile URLs
     if (normalized === DOMAIN_BASE || normalized === `${DOMAIN_BASE}/`) return false;
-    if (lower.includes('/real-estate-agents/') && lower.endsWith('/')) return false; // listing root
-    if (lower.includes('page=')) return false; // paginated listing pages
 
-    // Require a slug-like segment after agents/ or agent/
     try {
-        const { pathname } = new URL(normalized);
-        const segments = pathname.split('/').filter(Boolean);
-        const hasAgentsSegment = segments.includes('real-estate-agents') || segments.includes('real-estate-agent') || segments.includes('agent') || segments.includes('agents');
+        const parsed = new URL(normalized);
+        const lower = parsed.href.toLowerCase();
+        if (lower.includes('page=')) return false;
+
+        const segments = parsed.pathname.split('/').filter(Boolean);
+        if (segments.length === 0) return false;
+
         const last = segments[segments.length - 1] || '';
+        const baseSegment = segments[0] || '';
+
+        if (baseSegment === 'real-estate-agents' && segments.length === 1) return false;
+        if (baseSegment === 'real-estate-agents' && segments.length === 2 && LOCATION_SLUG_REGEX.test(last)) return false;
+
         const looksLikeSlug = last.length > 3 && /[a-z]/i.test(last);
         const hasId = /\d{5,}/.test(last);
+        const hasAgentsSegment = segments.includes('real-estate-agents') || segments.includes('real-estate-agent') || segments.includes('agent') || segments.includes('agents');
+
         return hasAgentsSegment && (looksLikeSlug || hasId);
     } catch (_) {
         return false;
@@ -89,11 +109,7 @@ const pickAgentHref = (hrefs) => {
     const candidate = filtered.find((href) => {
         const lower = href.toLowerCase();
         if (lower.startsWith('mailto:') || lower.startsWith('tel:')) return false;
-        return (
-            lower.includes('/real-estate-agents/') ||
-            lower.includes('/agent/') ||
-            lower.includes('/agents/')
-        );
+        return isLikelyAgentUrl(ensureAbsoluteUrl(href));
     });
     return candidate || filtered[0] || null;
 };
@@ -766,13 +782,26 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         });
 
         const page = await context.newPage();
-        await page.setExtraHTTPHeaders({
-            ...STEALTHY_HEADERS,
-            'User-Agent': getRandomUserAgent(),
-        });
+        page.setDefaultNavigationTimeout(PLAYWRIGHT_NAV_TIMEOUT_MS);
+        page.setDefaultTimeout(PLAYWRIGHT_NAV_TIMEOUT_MS);
 
         // Navigate to page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+        let navigated = false;
+        try {
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+            navigated = true;
+        } catch (err) {
+            log.warning(`Playwright goto domcontentloaded failed: ${err.message}`);
+        }
+
+        if (!navigated) {
+            try {
+                await page.goto(targetUrl, { waitUntil: 'commit', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+                navigated = true;
+            } catch (err) {
+                log.warning(`Playwright goto commit failed: ${err.message}`);
+            }
+        }
 
         // Accept cookie/consent if present
         try {
@@ -783,13 +812,15 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         }
 
         // Wait for content to load
-        try {
-            await page.waitForSelector(
-                '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], article[class*="agent"], div[class*="agent-card"]',
-                { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS },
-            );
-        } catch (e) {
-            log.warning('Timeout waiting for agent cards, continuing anyway');
+        if (navigated) {
+            try {
+                await page.waitForSelector(
+                    '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], article[class*="agent"], div[class*="agent-card"]',
+                    { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS },
+                );
+            } catch (e) {
+                log.warning('Timeout waiting for agent cards, continuing anyway');
+            }
         }
         
         // Scroll to load lazy images
@@ -810,13 +841,26 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
             });
         });
 
-        // Get page content
-        const html = await page.content();
+        let html = null;
+        if (navigated) {
+            html = await page.content();
+        } else {
+            try {
+                const response = await context.request.get(targetUrl, { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+                if (response.ok()) {
+                    html = await response.text();
+                }
+            } catch (err) {
+                log.warning(`Playwright request fallback failed: ${err.message}`);
+            }
+        }
         
         await browser.close();
 
         // Parse with cheerio
-        // Parse with cheerio
+        if (!html) {
+            return { agents: [], nextPage: null, totalResults: null };
+        }
         return await scrapeAgentListingPage({ url: targetUrl, proxyConfiguration, html, currentPage });
     } catch (error) {
         log.error(`Playwright scraping failed: ${error.message}`);
@@ -1069,7 +1113,12 @@ Actor.main(async () => {
         specialization = null,
     } = input;
 
-    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
+    const proxyConfig = await Actor.createProxyConfiguration(
+        proxyConfiguration || { useApifyProxy: true },
+    );
+    if (!proxyConfiguration) {
+        log.warning('Proxy configuration missing. Using Apify proxy by default.');
+    }
 
     // ========================================================================
     // INPUT VALIDATION
@@ -1130,6 +1179,7 @@ Actor.main(async () => {
 
     searchUrl = withPageParams(searchUrl, 1);
     log.info(`Final search URL: ${searchUrl}`);
+    let isRootSearch = isRootAgentSearchUrl(searchUrl);
 
     const allAgents = [];
     const seenIds = new Set();
@@ -1163,6 +1213,37 @@ Actor.main(async () => {
                 proxyConfiguration: proxyConfig,
                 currentPage,
             });
+        }
+
+        if ((!result || result.agents.length === 0) && currentPage === 1 && isRootSearch) {
+            for (const fallbackSlug of DEFAULT_AGENT_LOCATION_FALLBACKS) {
+                const fallbackUrl = withPageParams(buildAgentLocationUrl(fallbackSlug), 1);
+                log.warning(`No agents on root search. Trying fallback location: ${fallbackSlug}`);
+                let fallbackResult = await scrapeAgentListingPage({
+                    url: fallbackUrl,
+                    proxyConfiguration: proxyConfig,
+                    currentPage: 1,
+                });
+
+                const fallbackNeedBrowser =
+                    ENABLE_BROWSER_FALLBACK &&
+                    (!fallbackResult || fallbackResult.agents.length === 0 || fallbackResult.agents.length < 3);
+                if (fallbackNeedBrowser) {
+                    log.info('Attempting Playwright fallback on location page...');
+                    fallbackResult = await scrapeViaPlaywright({
+                        url: fallbackUrl,
+                        proxyConfiguration: proxyConfig,
+                        currentPage: 1,
+                    });
+                }
+
+                if (fallbackResult && fallbackResult.agents.length > 0) {
+                    result = fallbackResult;
+                    nextPageUrl = fallbackUrl;
+                    isRootSearch = false;
+                    break;
+                }
+            }
         }
 
         if (!result || result.agents.length === 0) {

@@ -34,7 +34,7 @@ const STEALTHY_HEADERS = {
     'Cache-Control': 'max-age=0',
 };
 
-const ENABLE_BROWSER_FALLBACK = false;
+const ENABLE_BROWSER_FALLBACK = true;
 const DEFAULT_PAGE_SIZE = 40;
 const MAX_CARD_PARSE = 160;
 const DATASET_BATCH_SIZE = 10;
@@ -638,19 +638,29 @@ const scrapeAgentDetails = async ({ url, proxyConfiguration }) => {
         log.debug(`Scraping agent details: ${url}`);
 
         const headers = createStealthHeaders();
-        const response = await gotScraping({
-            url,
-            headers,
-            proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-            responseType: 'text',
-            retry: {
-                limit: 1,
-                statusCodes: [408, 429, 500, 502, 503, 504],
-            },
-            timeout: { request: 20000 },
-        });
+        let response = null;
+        try {
+            response = await gotScraping({
+                url,
+                headers,
+                proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
+                responseType: 'text',
+                retry: {
+                    limit: 1,
+                    statusCodes: [408, 429, 500, 502, 503, 504],
+                },
+                timeout: { request: 20000 },
+            });
+        } catch (err) {
+            log.debug(`Detail gotScraping failed, trying Playwright: ${err.message}`);
+            const pageResult = await scrapeViaPlaywright({ url, proxyConfiguration, currentPage: 1 });
+            if (pageResult && pageResult.agents && pageResult.agents.length) {
+                return pageResult.agents[0];
+            }
+            throw err;
+        }
 
-        const $ = cheerioLoad(response.body);
+        const $ = cheerioLoad(response?.body || '');
         const details = {};
 
         const jsonLdData = extractJsonLd(response.body);
@@ -697,7 +707,7 @@ Actor.main(async () => {
         maxResults = 50,
         maxPages = 5,
         collectDetails = true,
-        usePlaywright = false,
+        usePlaywright = true,
         maxConcurrency = 3,
         proxyConfiguration,
         location = null,
@@ -784,7 +794,11 @@ Actor.main(async () => {
             currentPage,
         });
 
-        if ((!result || result.agents.length === 0) && (ENABLE_BROWSER_FALLBACK || usePlaywright)) {
+        const shouldBrowserFallback =
+            (ENABLE_BROWSER_FALLBACK || usePlaywright) &&
+            (!result || result.agents.length === 0 || (currentPage === 1 && result.agents.length < 3));
+
+        if (shouldBrowserFallback) {
             log.info('Attempting Playwright fallback...');
             result = await scrapeViaPlaywright({
                 url: nextPageUrl,

@@ -37,7 +37,7 @@ const STEALTHY_HEADERS = {
 
 const ENABLE_BROWSER_FALLBACK = true;
 const PAGE_REQUEST_TIMEOUT_MS = 25000;
-const PLAYWRIGHT_NAV_TIMEOUT_MS = 45000;
+const PLAYWRIGHT_NAV_TIMEOUT_MS = 60000;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -194,6 +194,7 @@ const createStealthHeaders = () => ({
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Referer': DOMAIN_BASE,
+    'Origin': DOMAIN_BASE,
     'X-Requested-With': 'XMLHttpRequest',
 });
 
@@ -560,19 +561,32 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
         // Parse agent cards from HTML - multiple selector strategies
         let agentCards = [];
         
-        // Strategy 1: Try data-testid selectors (newer Domain interface)
-        agentCards = $('[data-testid*="agent-card"], [data-testid*="agent-profile"]').toArray();
-        log.debug(`[Strategy 1] Found ${agentCards.length} cards with data-testid`);
+        // Strategy 1: data-testid selectors (newer Domain interface)
+        agentCards = $([
+            '[data-testid*="agent-card"]',
+            '[data-testid*="agent-card-wrapper"]',
+            '[data-testid*="agent-tile"]',
+            '[data-testid*="agentProfile"]',
+            '[data-testid*="agent-list-item"]',
+        ].join(',')).toArray();
+        log.debug(`[Strategy 1] Found ${agentCards.length} cards with data-testid patterns`);
         
         // Strategy 2: Try class-based selectors (common pattern)
         if (agentCards.length === 0) {
-            agentCards = $('article.agent-card, article[class*="agent"], div[class*="agent-card"], div[class*="agent-profile"]').toArray();
+            agentCards = $([
+                'article.agent-card',
+                'article[class*="agent"]',
+                'div[class*="agent-card"]',
+                'div[class*="agent-tile"]',
+                'div[class*="agent-profile"]',
+                'li[class*="agent"]',
+            ].join(',')).toArray();
             log.debug(`[Strategy 2] Found ${agentCards.length} cards with class selectors`);
         }
         
         // Strategy 3: Try generic container selectors
         if (agentCards.length === 0) {
-            agentCards = $('article, div[class*="card"]').toArray().filter((el) => {
+            agentCards = $('article, li, div[class*="card"]').toArray().filter((el) => {
                 const text = $(el).text().toLowerCase();
                 return text.includes('agent') || text.includes('agency');
             });
@@ -612,8 +626,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.id = idMatch ? idMatch[1] : null;
 
                 // Extract agent name - Strategy: Try multiple selectors
-                let nameText = cleanText($card.find('h2, h3, [class*="name"]').first().text());
-                if (!nameText) nameText = cleanText($card.find('[data-testid*="name"]').first().text());
+                let nameText = cleanText($card.find('[data-testid*="name"], [data-testid*="agent-name"], h2, h3, [class*="name"]').first().text());
                 if (!nameText) nameText = cleanText($card.find('a').first().text());
                 agent.name = nameText || null;
 
@@ -622,7 +635,7 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.title = titleText || null;
 
                 // Extract agency name
-                const agencyText = cleanText($card.find('[class*="agency"], [class*="company"]').first().text());
+                const agencyText = cleanText($card.find('[data-testid*="agency"], [class*="agency"], [class*="company"]').first().text());
                 agent.agency = agencyText || null;
 
                 // Extract agency URL
@@ -630,12 +643,12 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.agencyUrl = ensureAbsoluteUrl(agencyLink.attr('href')) || null;
 
                 // Extract phone number
-                const phoneText = $card.find('[class*="phone"], a[href^="tel:"]').first().text() || 
+                const phoneText = $card.find('[data-testid*="phone"], [class*="phone"], a[href^="tel:"]').first().text() || 
                                  $card.find('a[href^="tel:"]').attr('href') || '';
                 agent.phone = extractPhoneNumber(phoneText) || null;
 
                 // Extract email
-                const emailText = $card.find('[class*="email"], a[href^="mailto:"]').first().text() || 
+                const emailText = $card.find('[data-testid*="email"], [class*="email"], a[href^="mailto:"]').first().text() || 
                                  $card.find('a[href^="mailto:"]').attr('href') || '';
                 agent.email = extractEmail(emailText) || null;
 
@@ -644,11 +657,11 @@ const scrapeAgentListingPage = async ({ url, proxyConfiguration, html = null, cu
                 agent.suburb = suburbText || null;
 
                 // Extract profile image
-                const imgElem = $card.find('img[src*="domain"], img[src*="cloudinary"], img[alt*="agent"], img[alt*="Agent"]').first();
+                const imgElem = $card.find('img[data-testid*="agent"], img[src*="domain"], img[src*="cloudinary"], img[alt*="agent"], img[alt*="Agent"]').first();
                 agent.profileImage = imgElem.attr('src') || imgElem.attr('data-src') || null;
 
                 // Extract agency logo
-                const logoElem = $card.find('img[alt*="logo"], img[alt*="Logo"], img[class*="logo"]').first();
+                const logoElem = $card.find('img[data-testid*=\"agency\"], img[alt*=\"logo\"], img[alt*=\"Logo\"], img[class*=\"logo\"]').first();
                 agent.agencyLogo = logoElem.attr('src') || logoElem.attr('data-src') || null;
 
                 // Extract current listings count
@@ -733,6 +746,8 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
             userAgent: getRandomUserAgent(),
             viewport: { width: 1920, height: 1080 },
             locale: 'en-AU',
+            ignoreHTTPSErrors: true,
+            extraHTTPHeaders: createStealthHeaders(),
         });
 
         const page = await context.newPage();
@@ -741,22 +756,23 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
             'User-Agent': getRandomUserAgent(),
         });
 
-        // Lightweight blocking to speed up + reduce detection
-        await page.route('**/*', (route) => {
-            const req = route.request();
-            const type = req.resourceType();
-            if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-                return route.abort();
-            }
-            return route.continue();
-        });
-
         // Navigate to page
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
 
+        // Accept cookie/consent if present
+        try {
+            const acceptBtn = await page.waitForSelector('button:has-text("Accept"), button:has-text("Got it"), [aria-label*="accept"]', { timeout: 5000 });
+            if (acceptBtn) await acceptBtn.click({ delay: 50 });
+        } catch (_) {
+            // ignore
+        }
+
         // Wait for content to load
         try {
-            await page.waitForSelector('[data-testid*="agent"], .agent-card, [class*="agent"]', { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS });
+            await page.waitForSelector(
+                '[data-testid*="agent-card"], [data-testid*="agent-card-wrapper"], [data-testid*="agent-tile"], article[class*="agent"], div[class*="agent-card"]',
+                { timeout: PLAYWRIGHT_NAV_TIMEOUT_MS },
+            );
         } catch (e) {
             log.warning('Timeout waiting for agent cards, continuing anyway');
         }
@@ -784,6 +800,7 @@ const scrapeViaPlaywright = async ({ url, proxyConfiguration, currentPage = 1 })
         
         await browser.close();
 
+        // Parse with cheerio
         // Parse with cheerio
         return await scrapeAgentListingPage({ url: targetUrl, proxyConfiguration, html, currentPage });
     } catch (error) {

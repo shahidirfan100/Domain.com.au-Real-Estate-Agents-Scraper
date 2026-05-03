@@ -1,7 +1,9 @@
 import { Actor, log } from 'apify';
-import { Dataset, gotScraping } from 'crawlee';
-import { firefox } from 'playwright';
 import { load as cheerioLoad } from 'cheerio';
+import { Dataset } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import { firefox } from 'playwright';
+import { CookieJar } from 'tough-cookie';
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -22,6 +24,13 @@ const STATE_CAPITALS = {
     nt: 'darwin-nt-0800',
 };
 
+const DEFAULT_INPUT_FALLBACK = {
+    startUrl: `${DOMAIN_BASE}/real-estate-agents/${DEFAULT_AGENT_LOCATION}/`,
+    maxResults: 20,
+    maxPages: 3,
+    proxyConfiguration: { useApifyProxy: true },
+};
+
 // Rotate through multiple realistic user agents
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
@@ -31,26 +40,13 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:127.0) Gecko/20100101 Firefox/127.0',
 ];
 
-const STEALTHY_HEADERS = {
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept-Language': 'en-AU,en-US;q=0.9,en;q=0.8',
-    DNT: '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0',
-    Connection: 'keep-alive',
-};
-
 // Timings
-const PLAYWRIGHT_TIMEOUT_MS = 60000;
-const NAVIGATION_TIMEOUT_MS = 45000;
-const DEFAULT_PAGE_SIZE = 40;
+const PLAYWRIGHT_NAVIGATION_TIMEOUT_MS = 60000;
+const HTTP_REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_PAGE_SIZE = 15;
 const MAX_CARD_PARSE = 160;
 const DATASET_BATCH_SIZE = 10;
+const PAGE_FETCH_CONCURRENCY = 3;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -58,11 +54,48 @@ const DATASET_BATCH_SIZE = 10;
 
 const getRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
 
 const randomDelay = (min = 500, max = 1500) => sleep(min + Math.random() * (max - min));
 
-const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const isProvidedInputValue = (value) => {
+    if (value === undefined || value === null) return false;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+};
+
+const mergeWithFallbackInput = (rawInput) => {
+    const merged = { ...DEFAULT_INPUT_FALLBACK };
+    let providedCount = 0;
+
+    if (rawInput && typeof rawInput === 'object') {
+        for (const [key, value] of Object.entries(rawInput)) {
+            if (!isProvidedInputValue(value)) continue;
+            merged[key] = value;
+            providedCount++;
+        }
+    }
+
+    return { input: merged, usedFallbackInput: providedCount === 0 };
+};
+
+const normalizeProxyConfiguration = (proxyConfiguration) => {
+    if (!proxyConfiguration?.useApifyProxy) return proxyConfiguration;
+    if (proxyConfiguration.proxyUrls?.length) return proxyConfiguration;
+
+    const normalized = { ...proxyConfiguration };
+    if (!normalized.groups?.length) {
+        normalized.groups = ['RESIDENTIAL'];
+    }
+    if (!normalized.countryCode) {
+        normalized.countryCode = 'AU';
+    }
+    return normalized;
+};
 
 const cleanText = (text) => {
     if (!text) return null;
@@ -76,6 +109,19 @@ const ensureAbsoluteUrl = (url) => {
     return `${DOMAIN_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
 };
 
+const buildAgentProfileUrl = (value) => {
+    if (!value) return null;
+    if (value.startsWith('http')) return value;
+
+    const normalized = value.trim();
+    if (!normalized) return null;
+    if (normalized.startsWith('/real-estate-agent/')) return `${DOMAIN_BASE}${normalized}`;
+    if (normalized.startsWith('real-estate-agent/')) return `${DOMAIN_BASE}/${normalized}`;
+
+    const slug = normalized.replace(/^\/+|\/+$/g, '');
+    return `${DOMAIN_BASE}/real-estate-agent/${slug}/`;
+};
+
 const buildAgentLocationUrl = (slug) => `${DOMAIN_BASE}/real-estate-agents/${slug}/`;
 
 const isRootAgentSearchUrl = (url) => {
@@ -83,7 +129,7 @@ const isRootAgentSearchUrl = (url) => {
         const parsed = new URL(url);
         const normalizedPath = parsed.pathname.replace(/\/+$/, '/');
         return normalizedPath === '/real-estate-agents/';
-    } catch (_) {
+    } catch {
         return false;
     }
 };
@@ -115,7 +161,7 @@ const isLikelyAgentUrl = (url) => {
         const hasAgentsSegment = segments.includes('real-estate-agents') || segments.includes('real-estate-agent') || segments.includes('agent') || segments.includes('agents');
 
         return hasAgentsSegment && (looksLikeSlug || hasId);
-    } catch (_) {
+    } catch {
         return false;
     }
 };
@@ -146,344 +192,301 @@ const extractEmail = (text) => {
 };
 
 // ============================================================================
-// SESSION MANAGER - Handles Browser Session with Stealth & Cookie Management
+// API FETCH - HTTP only (got-scraping)
 // ============================================================================
 
-class SessionManager {
-    constructor(proxyConfiguration) {
-        this.proxyConfiguration = proxyConfiguration;
+const isAkamaiChallengePage = (body) => {
+    if (!body || typeof body !== 'string') return false;
+    const hasChallengeMarkers = body.includes('sec-if-cpt-container')
+        || body.includes('Powered and protected by Akamai')
+        || body.includes('progress-btn-disabled');
+    return hasChallengeMarkers && !body.includes('__NEXT_DATA__');
+};
+
+const compactRecord = (value) => {
+    if (value === null || value === undefined) return undefined;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        return trimmed.length ? trimmed : undefined;
+    }
+    if (Array.isArray(value)) {
+        const cleaned = value
+            .map((item) => compactRecord(item))
+            .filter((item) => item !== undefined);
+        return cleaned.length ? cleaned : undefined;
+    }
+    if (typeof value === 'object') {
+        const output = {};
+        for (const [key, nestedValue] of Object.entries(value)) {
+            const cleaned = compactRecord(nestedValue);
+            if (cleaned !== undefined) output[key] = cleaned;
+        }
+        return Object.keys(output).length ? output : undefined;
+    }
+    if (typeof value === 'number' && Number.isNaN(value)) return undefined;
+    return value;
+};
+
+const compactAgent = (agent) => compactRecord(agent) || {};
+
+class BrowserFallback {
+    constructor(proxyConfig, sessionId, userAgent) {
+        this.proxyConfig = proxyConfig;
+        this.sessionId = sessionId;
+        this.userAgent = userAgent;
         this.browser = null;
         this.context = null;
-        this.page = null;
-        this.cookies = [];
-        this.userAgent = getRandomUserAgent();
-        this.isInitialized = false;
     }
 
-    async initialize() {
-        log.info('Initializing stealthy Firefox session...');
-
-        const launchOptions = {
-            headless: true,
-            // Firefox-specific stealth args
-            firefoxUserPrefs: {
-                // Disable telemetry
-                'toolkit.telemetry.enabled': false,
-                'toolkit.telemetry.unified': false,
-                'toolkit.telemetry.archive.enabled': false,
-                // Disable tracking protection to avoid issues
-                'privacy.trackingprotection.enabled': false,
-                'privacy.trackingprotection.pbmode.enabled': false,
-                // Disable webdriver detection
-                'dom.webdriver.enabled': false,
-                // Disable navigator.webdriver
-                'marionette.enabled': false,
-                // Enable WebGL (some sites check this)
-                'webgl.disabled': false,
-                // Disable safe browsing (can cause delays)
-                'browser.safebrowsing.enabled': false,
-                'browser.safebrowsing.malware.enabled': false,
-                // Disable prefetching
-                'network.prefetch-next': false,
-                'network.dns.disablePrefetch': true,
-                // Disable service workers
-                'dom.serviceWorkers.enabled': false,
-            },
-        };
-
-        // Add proxy if configured
-        if (this.proxyConfiguration) {
-            const proxyUrl = await this.proxyConfiguration.newUrl();
+    async init() {
+        if (this.context) return;
+        const launchOptions = { headless: true };
+        if (this.proxyConfig) {
+            const proxyUrl = await this.proxyConfig.newUrl(this.sessionId);
             if (proxyUrl) {
-                const parsedProxy = new URL(proxyUrl);
+                const parsed = new URL(proxyUrl);
                 launchOptions.proxy = {
-                    server: `${parsedProxy.protocol}//${parsedProxy.hostname}:${parsedProxy.port}`,
-                    username: parsedProxy.username,
-                    password: parsedProxy.password,
+                    server: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+                    username: parsed.username || undefined,
+                    password: parsed.password || undefined,
                 };
-                log.debug(`Using proxy: ${parsedProxy.hostname}`);
             }
         }
 
         this.browser = await firefox.launch(launchOptions);
-
-        // Create context with realistic settings
-        const viewportWidth = 1920 + randomInt(-100, 100);
-        const viewportHeight = 1080 + randomInt(-50, 50);
-
         this.context = await this.browser.newContext({
-            userAgent: this.userAgent,
-            viewport: { width: viewportWidth, height: viewportHeight },
             locale: 'en-AU',
-            timezoneId: 'Australia/Sydney',
-            geolocation: { latitude: -31.9505, longitude: 115.8605 }, // Perth
-            permissions: ['geolocation'],
-            colorScheme: 'light',
-            deviceScaleFactor: 1,
-            hasTouch: false,
-            isMobile: false,
-            javaScriptEnabled: true,
-            bypassCSP: true,
-            ignoreHTTPSErrors: true,
+            userAgent: this.userAgent,
             extraHTTPHeaders: {
+                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-AU,en-US;q=0.9,en;q=0.8',
+                'Upgrade-Insecure-Requests': '1',
                 DNT: '1',
             },
+            viewport: { width: 1366, height: 768 },
+            ignoreHTTPSErrors: true,
         });
 
-        // Block unnecessary resources for speed
+        await this.context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+        });
+
         await this.context.route('**/*', async (route) => {
             const request = route.request();
-            const resourceType = request.resourceType();
+            const type = request.resourceType();
             const url = request.url();
+            const blockByType = ['image', 'media', 'font'].includes(type);
+            const blockByHost = url.includes('googletagmanager')
+                || url.includes('google-analytics')
+                || url.includes('doubleclick')
+                || url.includes('facebook.net')
+                || url.includes('hotjar')
+                || url.includes('segment.io')
+                || url.includes('clarity.ms');
 
-            // Block tracking and analytics
-            const blockedPatterns = [
-                'google-analytics',
-                'googletagmanager',
-                'facebook.net',
-                'doubleclick',
-                'hotjar',
-                'segment.io',
-                'amplitude',
-                'mixpanel',
-                'newrelic',
-                'optimizely',
-                'clarity.ms',
-            ];
-
-            const shouldBlock = blockedPatterns.some((pattern) => url.includes(pattern));
-
-            if (shouldBlock) {
-                await route.abort();
-            } else if (['font', 'media'].includes(resourceType)) {
-                // Block fonts and media to speed up
+            if (blockByType || blockByHost) {
                 await route.abort();
             } else {
                 await route.continue();
             }
         });
-
-        this.page = await this.context.newPage();
-
-        // Remove automation indicators
-        await this.page.addInitScript(() => {
-            // Override webdriver property
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-            });
-
-            // Override plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
-                ],
-            });
-
-            // Override languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-AU', 'en-US', 'en'],
-            });
-
-            // Override platform
-            Object.defineProperty(navigator, 'platform', {
-                get: () => 'Win32',
-            });
-
-            // Override hardware concurrency
-            Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => 8,
-            });
-
-            // Override device memory
-            Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => 8,
-            });
-
-            // Add Chrome object for compatibility
-            window.chrome = {
-                runtime: {},
-                loadTimes: () => ({}),
-                csi: () => ({}),
-                app: {},
-            };
-
-            // Override permissions
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) =>
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters);
-        });
-
-        // Skip homepage warm-up for faster initialization
-        // The stealth options are sufficient for Domain.com.au
-        this.isInitialized = true;
-        log.info('Stealthy Firefox session initialized');
-        return this;
     }
 
-    async simulateHumanBehavior() {
-        try {
-            // Random mouse movements
-            const moves = randomInt(3, 6);
-            for (let i = 0; i < moves; i++) {
-                const x = randomInt(100, 1800);
-                const y = randomInt(100, 900);
-                await this.page.mouse.move(x, y, { steps: randomInt(5, 15) });
-                await randomDelay(100, 300);
-            }
-
-            // Scroll down a bit
-            await this.page.evaluate(() => {
-                window.scrollBy(0, Math.random() * 500 + 200);
-            });
-            await randomDelay(500, 1000);
-
-            // Scroll back up
-            await this.page.evaluate(() => {
-                window.scrollBy(0, -Math.random() * 300);
-            });
-        } catch (_) {
-            // Ignore errors in simulation
-        }
+    async refreshContext() {
+        if (this.context) await this.context.close().catch(() => {});
+        if (this.browser) await this.browser.close().catch(() => {});
+        this.context = null;
+        this.browser = null;
+        await this.init();
     }
 
-    async navigateToUrl(url) {
-        if (!this.isInitialized) {
-            await this.initialize();
-        }
+    async fetchHtml({ url, referer = DOMAIN_BASE, retries = 3 }) {
+        let lastError = null;
 
-        log.debug(`Navigating to: ${url}`);
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            await this.init();
+            const page = await this.context.newPage();
 
-        try {
-            const response = await this.page.goto(url, {
-                waitUntil: 'domcontentloaded',
-                timeout: NAVIGATION_TIMEOUT_MS,
-            });
-
-            // Wait for any dynamic content
-            await randomDelay(1500, 3000);
-
-            // Simulate human behavior
-            await this.simulateHumanBehavior();
-
-            // Update cookies
-            this.cookies = await this.context.cookies();
-
-            const html = await this.page.content();
-            const statusCode = response?.status() || 0;
-
-            // Check for blocking
-            if (html.includes('403 Forbidden') || html.includes('Access Denied') || html.includes('captcha')) {
-                log.warning('Possible blocking detected, attempting to refresh session...');
-                await this.refreshSession();
-                return await this.navigateToUrl(url);
-            }
-
-            return { html, statusCode, cookies: this.cookies };
-        } catch (error) {
-            log.error(`Navigation failed: ${error.message}`);
-            throw error;
-        }
-    }
-
-    getCookieString() {
-        return this.cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-    }
-
-    getCookiesForGot() {
-        return this.getCookieString();
-    }
-
-    async refreshSession() {
-        log.info('Refreshing browser session...');
-        if (this.browser) {
             try {
-                await this.browser.close();
-            } catch (_) {
-                // Ignore close errors
+                await page.goto(DOMAIN_BASE, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
+                }).catch(() => {});
+                await randomDelay(400, 900);
+
+                const response = await page.goto(url, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
+                });
+
+                const waitForPayload = () => page.waitForFunction(
+                    () => {
+                        const hasPayload = Boolean(document.querySelector('#__NEXT_DATA__'));
+                        const hasAgentLink = Boolean(document.querySelector('a[href^="/real-estate-agent/"]'));
+                        return hasPayload || hasAgentLink;
+                    },
+                    { timeout: 9000 },
+                ).catch(() => {});
+
+                await randomDelay(700, 1400);
+                await waitForPayload();
+
+                const html = await page.content();
+                const statusCode = response?.status() || 0;
+                const title = await page.title().catch(() => '');
+                const hasStructuredPayload = html.includes('__NEXT_DATA__') || html.includes('ContactSearchContact:');
+                const hasAgentLinks = html.includes('/real-estate-agent/');
+
+                if (statusCode >= 400 || isAkamaiChallengePage(html) || (!hasStructuredPayload && !hasAgentLinks)) {
+                    await randomDelay(2000, 3500);
+                    await page.reload({
+                        waitUntil: 'domcontentloaded',
+                        timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
+                    }).catch(() => {});
+                    await waitForPayload();
+
+                    const retryHtml = await page.content();
+                    const retryTitle = await page.title().catch(() => title);
+                    const hasRetryPayload = retryHtml.includes('__NEXT_DATA__') || retryHtml.includes('ContactSearchContact:');
+                    const hasRetryAgentLinks = retryHtml.includes('/real-estate-agent/');
+                    if (!isAkamaiChallengePage(retryHtml) && (hasRetryPayload || hasRetryAgentLinks)) {
+                        await page.close().catch(() => {});
+                        return { html: retryHtml, statusCode, source: 'playwright-firefox-reload' };
+                    }
+
+                    await Actor.setValue('DEBUG_LAST_FETCH_FAILURE', {
+                        url,
+                        referer,
+                        attempt,
+                        statusCode,
+                        title: retryTitle,
+                        hasStructuredPayload: hasRetryPayload,
+                        hasAgentLinks: hasRetryAgentLinks,
+                        htmlSnippet: retryHtml.slice(0, 4000),
+                    });
+
+                    throw new Error(`Browser fetch did not return usable payload (status=${statusCode})`);
+                }
+
+                await page.close().catch(() => {});
+                return { html, statusCode, source: 'playwright-firefox' };
+            } catch (error) {
+                lastError = error;
+                await page.close().catch(() => {});
+                if (attempt < retries) {
+                    await this.refreshContext();
+                    await randomDelay(500, 1200);
+                }
             }
         }
-        this.isInitialized = false;
-        this.userAgent = getRandomUserAgent();
-        await this.initialize();
+
+        throw lastError || new Error('Browser fetch failed');
     }
 
     async close() {
-        if (this.browser) {
-            try {
-                await this.browser.close();
-            } catch (_) {
-                // Ignore
-            }
-        }
-        this.isInitialized = false;
+        if (this.context) await this.context.close().catch(() => {});
+        if (this.browser) await this.browser.close().catch(() => {});
+        this.context = null;
+        this.browser = null;
     }
 }
 
-// ============================================================================
-// HYBRID FETCH - Uses cookies from Playwright for got-scraping requests
-// ============================================================================
+function createPageFetcher(proxyConfig) {
+    const sessionId = `domain_${Date.now()}`;
+    const userAgent = getRandomUserAgent();
+    const cookieJar = new CookieJar();
+    const browserFallback = new BrowserFallback(proxyConfig, sessionId, userAgent);
+    let proxyUrlPromise = null;
+    let warmedUp = false;
 
-const hybridFetch = async ({ url, sessionManager, retries = 2 }) => {
-    const cookieString = sessionManager.getCookiesForGot();
-    const userAgent = sessionManager.userAgent;
-
-    const headers = {
-        ...STEALTHY_HEADERS,
-        'User-Agent': userAgent,
-        Cookie: cookieString,
-        Referer: DOMAIN_BASE,
+    const getProxyUrl = async () => {
+        if (!proxyConfig) return undefined;
+        if (!proxyUrlPromise) {
+            proxyUrlPromise = proxyConfig.newUrl(sessionId);
+        }
+        return proxyUrlPromise;
     };
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            log.debug(`Hybrid fetch attempt ${attempt}/${retries}: ${url}`);
+    const fetchViaHttp = async ({ url, referer = DOMAIN_BASE, retries = 2 }) => {
+        let lastError = null;
 
-            const response = await gotScraping({
-                url,
-                headers,
-                responseType: 'text',
-                timeout: { request: 20000 },
-                retry: { limit: 0 },
-                throwHttpErrors: false,
-            });
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const proxyUrl = await getProxyUrl();
 
-            const body = response.body || '';
-            const statusCode = response.statusCode;
+                if (!warmedUp) {
+                    await gotScraping.get(DOMAIN_BASE, {
+                        proxyUrl,
+                        cookieJar,
+                        throwHttpErrors: false,
+                        timeout: { request: HTTP_REQUEST_TIMEOUT_MS },
+                        headers: {
+                            'user-agent': userAgent,
+                            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'accept-language': 'en-AU,en-US;q=0.9,en;q=0.8',
+                            'upgrade-insecure-requests': '1',
+                            dnt: '1',
+                        },
+                    });
+                    warmedUp = true;
+                }
 
-            // Check for blocking
-            if (statusCode === 403 || statusCode === 503 || body.includes('403 Forbidden') || body.includes('Access Denied')) {
-                log.warning(`Request blocked (status: ${statusCode}), falling back to Playwright...`);
-                throw new Error('Blocked response');
+                const response = await gotScraping.get(url, {
+                    proxyUrl,
+                    cookieJar,
+                    throwHttpErrors: false,
+                    timeout: { request: HTTP_REQUEST_TIMEOUT_MS },
+                    headers: {
+                        'user-agent': userAgent,
+                        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'accept-language': 'en-AU,en-US;q=0.9,en;q=0.8',
+                        'upgrade-insecure-requests': '1',
+                        dnt: '1',
+                        referer,
+                    },
+                });
+
+                const html = response.body || '';
+                const statusCode = response.statusCode || 0;
+                const hasStructuredPayload = html.includes('__NEXT_DATA__') || html.includes('ContactSearchContact:');
+                const hasAgentLinks = html.includes('/real-estate-agent/');
+
+                if (statusCode < 400 && !isAkamaiChallengePage(html) && (hasStructuredPayload || hasAgentLinks)) {
+                    return { html, statusCode, source: 'http-got' };
+                }
+
+                lastError = new Error(`HTTP fetch did not return usable payload (status=${statusCode})`);
+                await randomDelay(250, 700);
+            } catch (error) {
+                lastError = error;
+                await randomDelay(250, 700);
             }
-
-            if (statusCode >= 200 && statusCode < 400 && body.length > 1000) {
-                return { html: body, statusCode, source: 'got-scraping' };
-            }
-
-            throw new Error(`Invalid response: status=${statusCode}, length=${body.length}`);
-        } catch (error) {
-            log.debug(`Got-scraping failed: ${error.message}`);
-
-            if (attempt === retries) {
-                // Final attempt: use Playwright directly
-                log.info('Falling back to Playwright for direct fetch...');
-                const result = await sessionManager.navigateToUrl(url);
-                return { ...result, source: 'playwright' };
-            }
-
-            await randomDelay(1000, 2000);
         }
-    }
 
-    // Should not reach here, but fallback anyway
-    const result = await sessionManager.navigateToUrl(url);
-    return { ...result, source: 'playwright' };
-};
+        throw lastError || new Error('HTTP fetch failed');
+    };
+
+    const fetchHtml = async ({ url, referer = DOMAIN_BASE, retries = 2 }) => {
+        try {
+            return await fetchViaHttp({ url, referer, retries });
+        } catch (httpError) {
+            log.debug(`HTTP fetch fallback triggered for ${url}: ${httpError.message}`);
+            return browserFallback.fetchHtml({
+                url,
+                referer,
+                retries: 2,
+            });
+        }
+    };
+
+    const close = async () => {
+        await browserFallback.close();
+    };
+
+    return { fetchHtml, close };
+}
 
 // ============================================================================
 // MULTI-TIER DATA EXTRACTION
@@ -495,7 +498,7 @@ const extractNextData = (html) => {
         if (match?.[1]) {
             return JSON.parse(match[1]);
         }
-    } catch (_) {
+    } catch {
         // Invalid JSON
     }
     return null;
@@ -513,7 +516,7 @@ const extractApolloState = (html) => {
         if (match?.[1]) {
             try {
                 return JSON.parse(match[1]);
-            } catch (_) {
+            } catch {
                 // Invalid JSON
             }
         }
@@ -526,7 +529,7 @@ const extractJsonLd = (html) => {
     const scripts = $('script[type="application/ld+json"]');
     const jsonLdData = [];
 
-    scripts.each((_, script) => {
+    scripts.toArray().forEach((script) => {
         try {
             const content = $(script).html();
             if (content) {
@@ -537,7 +540,7 @@ const extractJsonLd = (html) => {
                     jsonLdData.push(data);
                 }
             }
-        } catch (_) {
+        } catch {
             // Invalid JSON-LD
         }
     });
@@ -646,7 +649,7 @@ const normalizeAgentFromJson = (rawAgent) => {
 
     const urlCandidate =
         agentData.url ||
-        agentData.profileUrl ||
+        buildAgentProfileUrl(agentData.profileUrl) ||
         agentData.profilePageUrl ||
         agentData.profileSlug ||
         agentData.slug ||
@@ -693,12 +696,18 @@ const normalizeAgentFromJson = (rawAgent) => {
     return agent.url || agent.name ? agent : null;
 };
 
-const addMetadata = (agent) => {
+function addMetadata(agent) {
     if (!agent) return agent;
-    agent.scrapedAt = agent.scrapedAt || new Date().toISOString();
-    agent.source = agent.source || DOMAIN_BASE;
-    return agent;
-};
+    return {
+        ...agent,
+        scrapedAt: agent.scrapedAt || new Date().toISOString(),
+        source: agent.source || DOMAIN_BASE,
+    };
+}
+
+const getApolloRef = (value) => value?.__ref || null; // eslint-disable-line no-underscore-dangle
+
+const getApolloStateFromPageProps = (pageProps) => pageProps?.__APOLLO_STATE__ || null; // eslint-disable-line no-underscore-dangle
 
 // ============================================================================
 // MULTI-TIER EXTRACTION FROM HTML
@@ -716,95 +725,95 @@ const addMetadata = (agent) => {
  * - propertiesSold: totalSoldAndAuctioned
  */
 const extractAgentsFromApolloState = (apolloState) => {
-    const agents = [];
-
     if (!apolloState || typeof apolloState !== 'object') {
-        return agents;
+        return { agents: [], totalResults: null, totalPages: null, pageNumber: null };
     }
 
-    // Helper to resolve Apollo State references (e.g., {"__ref": "Reputation:123"})
-    const resolveRef = (obj) => {
-        if (obj && obj.__ref && apolloState[obj.__ref]) {
-            return apolloState[obj.__ref];
-        }
-        return obj;
-    };
+    const rootQuery = apolloState.ROOT_QUERY || {};
+    const contactSearchKeys = Object.keys(rootQuery).filter((key) => key.startsWith('contactSearchBySuburbs('));
 
-    // Find all ContactSearchContact entries
-    const contactKeys = Object.keys(apolloState).filter(key =>
-        key.startsWith('ContactSearchContact:')
-    );
+    if (!contactSearchKeys.length) {
+        return { agents: [], totalResults: null, totalPages: null, pageNumber: null };
+    }
 
-    log.debug(`Found ${contactKeys.length} ContactSearchContact entries in Apollo state`);
+    const selectedKey = contactSearchKeys
+        .map((key) => ({ key, entry: rootQuery[key] }))
+        .sort((left, right) => (right.entry?.total || 0) - (left.entry?.total || 0))[0];
+    const searchEntry = selectedKey?.entry;
+    const resultRefs = Array.isArray(searchEntry?.results) ? searchEntry.results : [];
+    const agents = [];
 
-    for (const key of contactKeys) {
+    log.debug(`Found ${resultRefs.length} structured agent refs in ${selectedKey?.key}`);
+
+    for (const ref of resultRefs) {
         try {
-            const contact = apolloState[key];
+            const contactRef = getApolloRef(ref);
+            const contact = contactRef ? apolloState[contactRef] : ref;
             if (!contact || typeof contact !== 'object') continue;
 
-            // Extract agent ID from key (e.g., "ContactSearchContact:1721099" -> "1721099")
-            const idMatch = key.match(/ContactSearchContact:(\d+)/);
-            const agentId = idMatch ? idMatch[1] : null;
+            const reputationRef = getApolloRef(contact.reputation);
+            const reputation = reputationRef
+                ? (apolloState[reputationRef] || {})
+                : (contact.reputation || {});
 
-            // Build profile URL
-            const profileUrl = contact.profileUrl
-                ? ensureAbsoluteUrl(contact.profileUrl)
-                : (agentId ? `${DOMAIN_BASE}/real-estate-agent/${contact.name?.toLowerCase().replace(/\s+/g, '-')}-${agentId}/` : null);
-
-            // Resolve reputation reference if it exists
-            const reputation = resolveRef(contact.reputation) || {};
-
-            // Extract first name by splitting full name
             let firstName = null;
+            let lastName = null;
             if (contact.name) {
                 const nameParts = contact.name.trim().split(/\s+/);
                 firstName = nameParts[0] || null;
+                lastName = nameParts.slice(1).join(' ').trim() || null;
             }
 
             const agent = {
-                id: agentId,
-                url: profileUrl,
+                id: String(contact.id || contact.agentIdV2 || '') || null,
+                agentIdV2: contact.agentIdV2 || null,
+                agencyId: contact.agencyId ?? null,
+                url: buildAgentProfileUrl(contact.profileUrl),
+                profileSlug: contact.profileUrl || null,
                 name: contact.name || null,
-                firstName: firstName,
-                lastName: contact.name ? contact.name.replace(firstName, '').trim() || null : null,
+                firstName,
+                lastName,
                 title: contact.jobTitle || null,
                 agency: contact.agencyName || null,
                 agencyUrl: contact.agencyProfileUrl ? ensureAbsoluteUrl(contact.agencyProfileUrl) : null,
                 phone: contact.telephone || contact.phone || null,
                 mobile: contact.mobile || null,
-                email: contact.hasEmail ? 'Available (click to reveal)' : null,  // Email not exposed directly
-                hasEmail: contact.hasEmail || false,
-                suburb: contact.suburb || contact.location || null,
-                state: contact.state || null,
-                postcode: contact.postcode || null,
+                hasEmail: Boolean(contact.hasEmail),
+                profileTier: contact.profileTier || null,
                 profileImage: contact.profilePhoto || contact.profilePhotoUrl || contact.photo || null,
                 agencyLogo: contact.agencyLogoUrl || contact.agencyLogo || null,
-                biography: contact.biography || contact.bio || contact.profileText || null,
-                // Performance metrics - CORRECT FIELD NAMES
-                averageSoldPrice: contact.averageSoldPrice || null,
-                averageSoldDaysOnMarket: contact.averageSoldDaysOnMarket || null,
+                brandColour: contact.brandColour || null,
+                averageSoldPrice: contact.averageSoldPrice ?? null,
+                averageSoldDaysOnMarket: contact.averageSoldDaysOnMarket ?? null,
                 propertiesForSale: contact.totalForSale ?? contact.propertiesForSale ?? null,
                 propertiesForRent: contact.totalForRent ?? contact.propertiesForRent ?? null,
                 propertiesSold: contact.totalSoldAndAuctioned ?? contact.propertiesSold ?? null,
-                totalSoldAndAuctioned: contact.totalSoldAndAuctioned || null,
-                // Reviews - CORRECT FIELD NAMES from reputation object
+                totalSoldAndAuctioned: contact.totalSoldAndAuctioned ?? null,
+                totalJointSoldAndAuctioned: contact.totalJointSoldAndAuctioned ?? null,
+                totalLeased: contact.totalLeased ?? null,
+                totalJointLeased: contact.totalJointLeased ?? null,
                 rating: reputation.overallStarRating ?? reputation.starRating ?? contact.rating ?? null,
                 reviewCount: reputation.numberOfReviews ?? reputation.reviewCount ?? contact.reviewCount ?? null,
-                // Source
+                recentRating: reputation.overallStarRatingRecent ?? null,
+                recentReviewCount: reputation.numberOfReviewsRecent ?? null,
                 source: DOMAIN_BASE,
                 scrapedAt: new Date().toISOString(),
             };
 
-            // Only add if we have valid data
             if (agent.name || agent.url) {
                 agents.push(agent);
             }
         } catch (err) {
-            log.debug(`Failed to parse contact ${key}: ${err.message}`);
+            log.debug(`Failed to parse structured contact ref: ${err.message}`);
         }
     }
 
-    return agents;
+    return {
+        agents,
+        totalResults: searchEntry?.total ?? null,
+        totalPages: searchEntry?.totalPages ?? null,
+        pageNumber: searchEntry?.pageNumber ?? null,
+    };
 };
 
 
@@ -820,20 +829,16 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
         const pageProps = nextData.props?.pageProps;
 
         // Check for Apollo State inside NEXT_DATA
-        const apolloState = pageProps?.__APOLLO_STATE__;
+        const apolloState = getApolloStateFromPageProps(pageProps);
         if (apolloState) {
-            agents = extractAgentsFromApolloState(apolloState);
+            const structured = extractAgentsFromApolloState(apolloState);
+            agents = structured.agents;
             if (agents.length > 0) {
-                extractionMethod = '__APOLLO_STATE__';
-                log.info(`Extracted ${agents.length} agents from __APOLLO_STATE__`);
-
-                // Try to get pagination info from Apollo state
-                const paginationKey = Object.keys(apolloState).find(k =>
-                    k.includes('pagination') || k.includes('Pagination')
-                );
-                if (paginationKey) {
-                    const paginationData = apolloState[paginationKey];
-                    totalResults = paginationData?.totalResults || paginationData?.total || null;
+                extractionMethod = 'structured';
+                log.info(`Extracted ${agents.length} agents from structured payload`);
+                totalResults = structured.totalResults;
+                if (structured.totalPages && structured.pageNumber && structured.pageNumber < structured.totalPages) {
+                    nextPage = deriveNextPageUrl(sourceUrl, structured.pageNumber);
                 }
             }
         }
@@ -845,8 +850,8 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
                 agents = agentArray
                     .map((item) => normalizeAgentFromJson(item))
                     .filter((item) => item && (item.url || item.name));
-                extractionMethod = '__NEXT_DATA__ (pageProps)';
-                log.info(`Extracted ${agents.length} agents from __NEXT_DATA__ pageProps`);
+                extractionMethod = 'structured';
+                log.info(`Extracted ${agents.length} agents from structured payload`);
 
                 totalResults = pageProps.totalAgents || pageProps.total || pageProps.pagination?.total || null;
             }
@@ -857,10 +862,15 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
     if (agents.length === 0) {
         const apolloState = extractApolloState(html);
         if (apolloState) {
-            agents = extractAgentsFromApolloState(apolloState);
+            const structured = extractAgentsFromApolloState(apolloState);
+            agents = structured.agents;
             if (agents.length > 0) {
-                extractionMethod = 'Apollo State (window)';
-                log.info(`Extracted ${agents.length} agents from window Apollo State`);
+                extractionMethod = 'structured';
+                log.info(`Extracted ${agents.length} agents from structured payload`);
+                totalResults = structured.totalResults;
+                if (structured.totalPages && structured.pageNumber && structured.pageNumber < structured.totalPages) {
+                    nextPage = deriveNextPageUrl(sourceUrl, structured.pageNumber);
+                }
             }
 
             // Fallback to generic search
@@ -870,8 +880,8 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
                     agents = agentArray
                         .map((item) => normalizeAgentFromJson(item))
                         .filter((item) => item && (item.url || item.name));
-                    extractionMethod = 'Apollo State (generic)';
-                    log.info(`Extracted ${agents.length} agents from Apollo State (generic)`);
+                    extractionMethod = 'structured';
+                    log.info(`Extracted ${agents.length} agents from structured payload`);
                 }
             }
         }
@@ -908,8 +918,7 @@ const extractAgentsMultiTier = (html, sourceUrl, currentPage) => {
     return { agents: agents.map(addMetadata), totalResults, nextPage, extractionMethod };
 };
 
-
-const parseAgentsFromHtml = (html) => {
+function parseAgentsFromHtml(html) {
     const $ = cheerioLoad(html);
     const agents = [];
     let totalResults = null;
@@ -1050,7 +1059,7 @@ const parseAgentsFromHtml = (html) => {
                 profileImage: $card.find('img[data-testid="fe-co-avatar--image"], img[alt*="agent"], img[alt*="Agent"]').first().attr('src') || null,
                 agencyLogo: $card.find('img[data-testid*="agency"], img[alt*="logo"], img[alt*="Logo"]').first().attr('src') || null,
                 averageSoldPrice: avgSoldPrice,
-                propertiesSold: propertiesSold,
+                propertiesSold,
                 source: DOMAIN_BASE,
                 scrapedAt: new Date().toISOString(),
             };
@@ -1084,9 +1093,9 @@ const parseAgentsFromHtml = (html) => {
     if (totalMatch) totalResults = parseInt(totalMatch[1].replace(/,/g, ''), 10);
 
     return { agents, totalResults, nextPage: ensureAbsoluteUrl(nextPageLink) };
-};
+}
 
-const deriveNextPageUrl = (url, currentPage) => {
+function deriveNextPageUrl(url, currentPage) {
     try {
         const parsed = new URL(url);
         const current = currentPage || parseInt(parsed.searchParams.get('page') || '1', 10) || 1;
@@ -1097,161 +1106,11 @@ const deriveNextPageUrl = (url, currentPage) => {
         log.debug(`Could not derive next page: ${err.message}`);
         return null;
     }
-};
-
-// ============================================================================
-// DETAIL PAGE SCRAPING
-// ============================================================================
-
-const scrapeAgentDetails = async ({ url, sessionManager }) => {
-    try {
-        log.debug(`Scraping agent details: ${url}`);
-
-        const { html } = await hybridFetch({ url, sessionManager, retries: 2 });
-
-        const $ = cheerioLoad(html);
-        const details = {};
-
-        // __NEXT_DATA__ extraction - Profile page has Contact object with more details
-        const nextData = extractNextData(html);
-        if (nextData?.props?.pageProps) {
-            const pageProps = nextData.props.pageProps;
-            const apolloState = pageProps.__APOLLO_STATE__;
-
-            if (apolloState) {
-                // Find the main Contact object (not ContactSearchContact)
-                const contactKey = Object.keys(apolloState).find(k =>
-                    k.startsWith('Contact:') && !k.includes('Search')
-                );
-
-                if (contactKey) {
-                    const contact = apolloState[contactKey];
-
-                    // Extract fields from profile page Contact object
-                    details.firstName = contact.firstName || null;
-                    details.biography = contact.profileText || contact.biography || null;
-                    details.phone = contact.telephone || contact.phone || null;
-                    details.mobile = contact.mobile || null;
-
-                    // Get full name if available
-                    if (contact.name && !details.firstName) {
-                        const nameParts = contact.name.trim().split(/\s+/);
-                        details.firstName = nameParts[0] || null;
-                    }
-
-                    // Check for listing stats in nested objects
-                    const listingsKey = Object.keys(apolloState).find(k =>
-                        k.includes('listingsByAgentIdV2')
-                    );
-                    if (listingsKey) {
-                        const listings = apolloState[listingsKey];
-                        if (listings) {
-                            details.propertiesForSale = listings.saleListings?.total ?? null;
-                            details.propertiesForRent = listings.leaseListings?.total ?? null;
-                            details.propertiesSold = listings.soldListings?.total ?? null;
-                        }
-                    }
-                }
-            }
-
-            // Fallback to agent in pageProps
-            if (pageProps.agent) {
-                const agentData = normalizeAgentFromJson(pageProps.agent);
-                if (agentData) {
-                    for (const [key, value] of Object.entries(agentData)) {
-                        if (value && !details[key]) details[key] = value;
-                    }
-                }
-            }
-        }
-
-        // JSON-LD extraction
-        const jsonLdData = extractJsonLd(html);
-        const jsonLdAgent = parseJsonLdAgent(jsonLdData);
-        if (jsonLdAgent) {
-            for (const [key, value] of Object.entries(jsonLdAgent)) {
-                if (value && !details[key]) details[key] = value;
-            }
-        }
-
-        // HTML fallback
-        if (!details.name) {
-            details.name = cleanText($('[data-testid="agent-profile-name"], h1, [class*="agent-name"]').first().text());
-        }
-        if (!details.title) {
-            details.title = cleanText($('[data-testid="agent-profile-title"], [class*="agent-title"]').first().text());
-        }
-        if (!details.agency) {
-            details.agency = cleanText($('[data-testid="agency-name"], [class*="agency-name"]').first().text());
-        }
-        if (!details.phone) {
-            const phoneText = $('[data-testid="agent-phone"], [class*="phone"], a[href^="tel:"]').first().text();
-            details.phone = extractPhoneNumber(phoneText);
-        }
-        if (!details.email) {
-            const emailText = $('[data-testid="agent-email"], [class*="email"], a[href^="mailto:"]').first().text();
-            details.email = extractEmail(emailText);
-        }
-        if (!details.officeAddress) {
-            details.officeAddress = cleanText($('[data-testid="agent-address"], [class*="office-address"]').first().text());
-        }
-        if (!details.biography) {
-            // Try multiple biography selectors
-            details.biography = cleanText(
-                $('[data-testid="agent-bio"], [class*="biography"], [class*="about-text"], [class*="profile-text"], .agent-bio, .about-section p').first().text()
-            );
-
-            // If still no biography, try to get all text from about section
-            if (!details.biography) {
-                const aboutSection = $('[class*="about"], [class*="bio"]').first();
-                if (aboutSection.length) {
-                    details.biography = cleanText(aboutSection.find('p').toArray().map(p => $(p).text()).join(' '));
-                }
-            }
-        }
-
-        // Clean up HTML from biography if present
-        if (details.biography && details.biography.includes('<')) {
-            details.biography = details.biography.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        }
-
-        return details;
-    } catch (error) {
-        log.warning(`Failed to scrape agent details: ${error.message}`);
-        return {};
-    }
-};
-
-
-// ============================================================================
-// HELPER: Concurrency Limiter & Dataset Pusher
-// ============================================================================
-
-function createConcurrencyLimiter(maxConcurrency) {
-    let active = 0;
-    const queue = [];
-
-    const next = () => {
-        if (active >= maxConcurrency || queue.length === 0) return;
-
-        active++;
-        const { task, resolve, reject } = queue.shift();
-
-        task()
-            .then(resolve)
-            .catch(reject)
-            .finally(() => {
-                active--;
-                next();
-            });
-    };
-
-    return (task) =>
-        new Promise((resolve, reject) => {
-            queue.push({ task, resolve, reject });
-            next();
-        });
 }
+
+// ============================================================================
+// HELPER: Dataset Pusher
+// ============================================================================
 
 function createDatasetPusher(batchSize) {
     const size = Math.max(1, batchSize || DATASET_BATCH_SIZE);
@@ -1282,223 +1141,238 @@ function createDatasetPusher(batchSize) {
     return { enqueue, flush };
 }
 
+async function mapWithConcurrency(items, limit, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (nextIndex < items.length) {
+            const currentIndex = nextIndex;
+            nextIndex++;
+            results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+        }
+    };
+
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+}
+
+const computeTargetPageCount = ({ maxResults, maxPages, totalResults, firstPageCount }) => {
+    const perPage = Math.max(1, firstPageCount || DEFAULT_PAGE_SIZE);
+    const pageCountForResults = Math.ceil(maxResults / perPage);
+    const pageCountForTotal = totalResults ? Math.ceil(totalResults / perPage) : maxPages;
+    return Math.max(1, Math.min(maxPages, pageCountForResults, pageCountForTotal));
+};
+
+const buildSearchUrl = ({ startUrl, state, specialization, startUrlProvided }) => {
+    let baseUrl = startUrl;
+
+    if (state && (!startUrlProvided || isRootAgentSearchUrl(startUrl))) {
+        const stateKey = String(state).toLowerCase().trim();
+        const locationSlug = STATE_CAPITALS[stateKey] || DEFAULT_AGENT_LOCATION;
+        baseUrl = buildAgentLocationUrl(locationSlug);
+        log.info(`Using state capital for ${stateKey.toUpperCase()}: ${locationSlug}`);
+    } else if (state && startUrlProvided) {
+        log.info('Ignoring state filter because an explicit startUrl was provided');
+    }
+
+    const parsed = new URL(baseUrl);
+    if (!parsed.hostname.includes('domain.com.au')) {
+        throw new Error('Invalid input: startUrl must be from domain.com.au');
+    }
+
+    if (specialization) parsed.searchParams.set('specialization', String(specialization));
+
+    return parsed.toString();
+};
+
 // ============================================================================
 // MAIN ACTOR LOGIC
 // ============================================================================
 
 Actor.main(async () => {
-    const input = await Actor.getInput();
+    const rawInput = (await Actor.getInput()) || {};
+    const { input, usedFallbackInput } = mergeWithFallbackInput(rawInput);
+    const startUrlProvided = isProvidedInputValue(rawInput.startUrl);
 
     const {
-        startUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION),
-        maxResults = 50,
-        maxPages = 5,
-        collectDetails = true,
-        maxConcurrency = 3,
-        proxyConfiguration,
-        location = null,
-        suburb = null,
-        state = null,
-        agencyName = null,
-        specialization = null,
-    } = input || {};
-
-    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
-
-    const validatedMaxResults = Math.max(1, Math.min(maxResults || 50, 1000));
-    const validatedMaxPages = Math.max(1, Math.min(maxPages || 5, 50));
-    const pageEstimate = Math.ceil(validatedMaxResults / Math.max(20, DEFAULT_PAGE_SIZE));
-    const pageLimit = Math.min(
-        50,
-        Math.max(validatedMaxPages, pageEstimate, Math.ceil(validatedMaxResults / 15))
-    );
-
-    if (!startUrl.includes('domain.com.au')) {
-        throw new Error('Invalid input: startUrl must be from domain.com.au');
-    }
-
-    log.info('Domain.com.au Real Estate Agents Scraper started', {
         startUrl,
-        maxResults: validatedMaxResults,
-        maxPages: pageLimit,
-        collectDetails,
-    });
+        maxResults,
+        maxPages,
+        proxyConfiguration,
+        state = null,
+        specialization = null,
+    } = input;
 
-    // Build search URL - location options override startUrl if provided
-    let searchUrl = startUrl;
-
-    // Check if user provided location-based filters
-    const hasLocationFilters = location || suburb || state;
-    const hasOtherFilters = agencyName || specialization;
-
-    // If any location filter is set, build URL from that (ignoring startUrl)
-    if (hasLocationFilters || hasOtherFilters) {
-        let locationSlug = null;
-
-        if (location) {
-            // User provided full location slug (e.g., "sydney-nsw-2000")
-            locationSlug = location.toLowerCase().replace(/\s+/g, '-');
-            log.info(`Using provided location: ${locationSlug}`);
-        } else if (suburb) {
-            // User provided suburb with postcode (e.g., "paddington-nsw-2021")
-            locationSlug = suburb.toLowerCase().replace(/\s+/g, '-');
-            log.info(`Using provided suburb: ${locationSlug}`);
-        } else if (state) {
-            // User only provided state - use state capital with postcode
-            const stateKey = state.toLowerCase();
-            locationSlug = STATE_CAPITALS[stateKey] || DEFAULT_AGENT_LOCATION;
-            log.info(`Using state capital for ${state.toUpperCase()}: ${locationSlug}`);
-        } else {
-            // No location but has other filters - use default location
-            locationSlug = DEFAULT_AGENT_LOCATION;
-            log.info(`Using default location: ${locationSlug}`);
-        }
-
-        const baseUrl = buildAgentLocationUrl(locationSlug);
-
-        const params = new URLSearchParams();
-        if (agencyName) params.append('agency', agencyName);
-        if (specialization) params.append('specialization', specialization);
-
-        const queryString = params.toString();
-        searchUrl = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+    const normalizedProxyConfiguration = normalizeProxyConfiguration(proxyConfiguration);
+    if (normalizedProxyConfiguration?.useApifyProxy) {
+        log.info('Using Apify proxy configuration', {
+            groups: normalizedProxyConfiguration.groups || [],
+            countryCode: normalizedProxyConfiguration.countryCode || null,
+        });
     }
 
-    // Ensure we don't use root agent URL which returns no results
+    const proxyConfig = normalizedProxyConfiguration
+        ? await Actor.createProxyConfiguration(normalizedProxyConfiguration)
+        : null;
+    const validatedMaxResults = Math.max(1, Math.min(maxResults || 20, 1000));
+    const validatedMaxPages = Math.max(1, Math.min(maxPages || 3, 50));
+
+    let searchUrl = buildSearchUrl({ startUrl, state, specialization, startUrlProvided });
     if (isRootAgentSearchUrl(searchUrl)) {
         searchUrl = buildAgentLocationUrl(DEFAULT_AGENT_LOCATION);
         log.warning(`Root search URL detected. Using default location: ${DEFAULT_AGENT_LOCATION}`);
     }
 
-    log.info(`Final search URL: ${searchUrl}`);
-
-    // Initialize session manager with stealth browser
-    const sessionManager = new SessionManager(proxyConfig);
-    await sessionManager.initialize();
+    log.info('Domain.com.au Real Estate Agents Scraper started', {
+        startUrl,
+        searchUrl,
+        maxResults: validatedMaxResults,
+        maxPages: validatedMaxPages,
+        usedFallbackInput,
+    });
 
     const allAgents = [];
     const seenIds = new Set();
-    let currentPage = 1;
-    let nextPageUrl = searchUrl;
-    let totalResultsCount = null;
     const datasetPusher = createDatasetPusher(DATASET_BATCH_SIZE);
-    const detailLimiter = collectDetails ? createConcurrencyLimiter(Math.max(1, Math.min(maxConcurrency || 3, 10))) : null;
-    const detailTasks = [];
-    let detailsCollected = 0;
+    const pageFetcher = createPageFetcher(proxyConfig);
+
+    let pagesProcessed = 0;
+    let httpPagesUsed = 0;
+    let browserPagesUsed = 0;
+    let totalResultsCount = null;
+
+    const addAgentsToDataset = (agents, pageNumber) => {
+        let addedThisPage = 0;
+        const newItemsThisPage = [];
+
+        for (const agent of agents) {
+            const dedupeKey = agent.id || agent.url || agent.name;
+            if (!dedupeKey || seenIds.has(dedupeKey)) continue;
+
+            seenIds.add(dedupeKey);
+            const normalized = compactAgent(addMetadata(agent));
+            allAgents.push(normalized);
+            newItemsThisPage.push({ ...normalized });
+            addedThisPage++;
+
+            if (allAgents.length >= validatedMaxResults) break;
+        }
+
+        if (newItemsThisPage.length) {
+            datasetPusher.enqueue(newItemsThisPage);
+        }
+
+        log.info(`Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`, {
+            page: pageNumber,
+        });
+    };
 
     try {
-        while (nextPageUrl && allAgents.length < validatedMaxResults && currentPage <= pageLimit) {
-            log.info(`Page ${currentPage}/${pageLimit} - Collected: ${allAgents.length}/${validatedMaxResults}`, {
-                url: nextPageUrl,
+        log.info(`Page 1/${validatedMaxPages} - Collected: 0/${validatedMaxResults}`, {
+            url: searchUrl,
+        });
+
+        const firstFetch = await pageFetcher.fetchHtml({
+            url: searchUrl,
+            referer: DOMAIN_BASE,
+            retries: 2,
+        });
+        if (firstFetch.source.startsWith('http')) {
+            httpPagesUsed++;
+        } else {
+            browserPagesUsed++;
+        }
+
+        const firstResult = extractAgentsMultiTier(firstFetch.html, searchUrl, 1);
+        if (!firstResult || firstResult.agents.length === 0) {
+            throw new Error('No agents found on page 1');
+        }
+
+        pagesProcessed++;
+        log.info(`Found ${firstResult.agents.length} agents on page 1`, {
+            source: firstFetch.source,
+        });
+
+        if (firstResult.totalResults) {
+            totalResultsCount = firstResult.totalResults;
+            log.info(`Total available: ${totalResultsCount} agents`);
+        }
+
+        addAgentsToDataset(firstResult.agents, 1);
+
+        const targetPageCount = computeTargetPageCount({
+            maxResults: validatedMaxResults,
+            maxPages: validatedMaxPages,
+            totalResults: totalResultsCount,
+            firstPageCount: firstResult.agents.length,
+        });
+
+        const pageJobs = [];
+        let nextPageUrl = firstResult.nextPage || deriveNextPageUrl(searchUrl, 1);
+        for (let pageNumber = 2; pageNumber <= targetPageCount && nextPageUrl; pageNumber++) {
+            pageJobs.push({ pageNumber, url: nextPageUrl });
+            nextPageUrl = deriveNextPageUrl(nextPageUrl, pageNumber);
+        }
+
+        const pageResults = await mapWithConcurrency(pageJobs, PAGE_FETCH_CONCURRENCY, async (job) => {
+            if (allAgents.length >= validatedMaxResults) return null;
+
+            log.info(`Page ${job.pageNumber}/${targetPageCount} - Collected: ${allAgents.length}/${validatedMaxResults}`, {
+                url: job.url,
             });
 
-            // Fetch page using hybrid approach
-            const { html, source } = await hybridFetch({
-                url: nextPageUrl,
-                sessionManager,
+            const fetched = await pageFetcher.fetchHtml({
+                url: job.url,
+                referer: searchUrl,
                 retries: 2,
             });
 
-            log.debug(`Page fetched via ${source}`);
-
-            // Extract agents using multi-tier approach
-            const result = extractAgentsMultiTier(html, nextPageUrl, currentPage);
-
-            if (!result || result.agents.length === 0) {
-                log.warning(`No agents found on page ${currentPage}, stopping pagination`);
-                break;
+            if (fetched.source.startsWith('http')) {
+                httpPagesUsed++;
+            } else {
+                browserPagesUsed++;
             }
 
-            log.info(`Extraction method: ${result.extractionMethod}, found ${result.agents.length} agents`);
+            const result = extractAgentsMultiTier(fetched.html, job.url, job.pageNumber);
+            return { ...job, source: fetched.source, result };
+        });
 
-            if (result.totalResults && !totalResultsCount) {
-                totalResultsCount = result.totalResults;
-                log.info(`Total available: ${totalResultsCount} agents`);
+        for (const pageResult of pageResults.filter(Boolean).sort((left, right) => left.pageNumber - right.pageNumber)) {
+            if (allAgents.length >= validatedMaxResults) break;
+
+            if (!pageResult.result || pageResult.result.agents.length === 0) {
+                log.warning(`No agents found on page ${pageResult.pageNumber}, skipping`, {
+                    source: pageResult.source,
+                });
+                continue;
             }
 
-            let addedThisPage = 0;
-            const newItemsThisPage = [];
-            for (const agent of result.agents) {
-                const dedupeKey = agent.id || agent.url || agent.name;
-                if (!dedupeKey || seenIds.has(dedupeKey)) continue;
+            pagesProcessed++;
+            log.info(`Found ${pageResult.result.agents.length} agents on page ${pageResult.pageNumber}`, {
+                source: pageResult.source,
+            });
 
-                seenIds.add(dedupeKey);
-                const normalized = addMetadata(agent);
-                allAgents.push(normalized);
-                newItemsThisPage.push({ ...normalized });
-                addedThisPage++;
-
-                if (collectDetails && detailLimiter) {
-                    detailTasks.push(
-                        detailLimiter(async () => {
-                            try {
-                                // Check if URL is valid for detail scraping
-                                // Accept URLs with /real-estate-agent/ pattern
-                                const hasValidUrl = normalized.url &&
-                                    (normalized.url.includes('/real-estate-agent/') ||
-                                        normalized.url.includes('/real-estate-agents/'));
-
-                                if (hasValidUrl) {
-                                    const details = await scrapeAgentDetails({
-                                        url: normalized.url,
-                                        sessionManager,
-                                    });
-
-                                    for (const [key, value] of Object.entries(details)) {
-                                        if (value && !normalized[key]) normalized[key] = value;
-                                    }
-                                    detailsCollected++;
-                                }
-
-                                // ALWAYS push data to dataset
-                                datasetPusher.enqueue({ ...addMetadata(normalized) });
-                                await randomDelay(200, 500);
-                            } catch (error) {
-                                log.warning(`Failed details for ${normalized.url}: ${error.message}`);
-                                // Still push data even on error
-                                datasetPusher.enqueue({ ...addMetadata(normalized) });
-                            }
-                        })
-                    );
-                }
-
-                if (allAgents.length >= validatedMaxResults) break;
+            if (pageResult.result.totalResults && !totalResultsCount) {
+                totalResultsCount = pageResult.result.totalResults;
             }
 
-            log.info(`Added ${addedThisPage} unique agents (${allAgents.length}/${validatedMaxResults} total)`);
-            if (!collectDetails && newItemsThisPage.length) {
-                datasetPusher.enqueue(newItemsThisPage);
-            }
-
-            nextPageUrl = result.nextPage;
-            currentPage++;
-
-            if (nextPageUrl && allAgents.length < validatedMaxResults) {
-                const delay = 1500 + Math.random() * 2000;
-                log.debug(`Rate limiting: ${Math.round(delay)}ms before next page`);
-                await sleep(delay);
-            }
+            addAgentsToDataset(pageResult.result.agents, pageResult.pageNumber);
         }
 
-        if (collectDetails && allAgents.length > 0) {
-            log.info(`Collecting full details for ${allAgents.length} agents...`);
-            await Promise.all(detailTasks);
-            await datasetPusher.flush();
-            log.info(`Details collected for ${detailsCollected}/${allAgents.length} agents`);
-        } else {
-            await datasetPusher.flush();
-        }
+        await datasetPusher.flush();
     } finally {
-        // Clean up browser
-        await sessionManager.close();
+        await pageFetcher.close();
     }
 
     log.info('='.repeat(70));
     log.info('SCRAPING COMPLETED SUCCESSFULLY');
     log.info('='.repeat(70));
     log.info(`Agents scraped: ${allAgents.length}/${validatedMaxResults}`);
-    log.info(`Pages processed: ${currentPage - 1}/${pageLimit}`);
-    log.info(`Details collected: ${collectDetails ? 'YES' : 'NO'}`);
+    log.info(`Pages processed: ${pagesProcessed}/${validatedMaxPages}`);
+    log.info(`HTTP pages used: ${httpPagesUsed}`);
+    log.info(`Browser pages used: ${browserPagesUsed}`);
     log.info(`Total available: ${totalResultsCount || 'Unknown'}`);
     log.info('='.repeat(70));
 });

@@ -1,14 +1,14 @@
 # Specify the base Docker image. You can read more about
 # the available images at https://crawlee.dev/docs/guides/docker-images
 # Using Firefox image for stealthy scraping
-FROM apify/actor-node-playwright-firefox:22-1.56.1
+FROM apify/actor-node-playwright-firefox:24-1.59.1
 
 # Check preinstalled packages
 RUN npm ls @crawlee/core apify puppeteer playwright
 
-# Copy just package.json and package-lock.json
+# Copy dependency metadata and the Playwright version check first
 # to speed up the build using Docker layer cache.
-COPY --chown=myuser:myuser package*.json Dockerfile ./
+COPY --chown=myuser:myuser package*.json Dockerfile check-playwright-version.mjs ./
 
 # Check Playwright version is the same as the one from base image.
 RUN node check-playwright-version.mjs
@@ -31,4 +31,4 @@ RUN npm --quiet set progress=false \
 # for most source file changes.
 COPY --chown=myuser:myuser . ./
 
-CMD ["node", "src/main.js"]
+CMD ["npm", "start", "--silent"]

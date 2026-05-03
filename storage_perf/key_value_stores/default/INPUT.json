@@ -1,7 +1,7 @@
 {
   "startUrl": "https://www.domain.com.au/real-estate-agents/sydney-nsw-2000/",
-  "maxResults": 20,
-  "maxPages": 3,
+  "maxResults": 100,
+  "maxPages": 10,
   "proxyConfiguration": {
     "useApifyProxy": true
   }

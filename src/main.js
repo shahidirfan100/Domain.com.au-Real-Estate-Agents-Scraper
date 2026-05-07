@@ -97,6 +97,19 @@ const normalizeProxyConfiguration = (proxyConfiguration) => {
     return normalized;
 };
 
+const isProxyConnectionError = (error) => {
+    const code = String(error?.code || '').toLowerCase();
+    const message = String(error?.message || '').toLowerCase();
+    return code === 'econnrefused'
+        || code === 'econnreset'
+        || code === 'etimedout'
+        || message.includes('ns_error_proxy_connection_refused')
+        || message.includes('proxy_connection_refused')
+        || message.includes('tunneling socket could not be established')
+        || message.includes('connect econnrefused')
+        || (message.includes('proxy') && message.includes('refused'));
+};
+
 const cleanText = (text) => {
     if (!text) return null;
     const cleaned = text.replace(/\s+/g, ' ').trim();
@@ -232,17 +245,26 @@ const compactAgent = (agent) => compactRecord(agent) || {};
 class BrowserFallback {
     constructor(proxyConfig, sessionId, userAgent) {
         this.proxyConfig = proxyConfig;
-        this.sessionId = sessionId;
+        this.sessionBaseId = sessionId;
+        this.sessionNonce = 0;
         this.userAgent = userAgent;
         this.browser = null;
         this.context = null;
+    }
+
+    getSessionId() {
+        return `${this.sessionBaseId}_${this.sessionNonce}`;
+    }
+
+    rotateProxySession() {
+        this.sessionNonce += 1;
     }
 
     async init() {
         if (this.context) return;
         const launchOptions = { headless: true };
         if (this.proxyConfig) {
-            const proxyUrl = await this.proxyConfig.newUrl(this.sessionId);
+            const proxyUrl = await this.proxyConfig.newUrl(this.getSessionId());
             if (proxyUrl) {
                 const parsed = new URL(proxyUrl);
                 launchOptions.proxy = {
@@ -294,11 +316,12 @@ class BrowserFallback {
         });
     }
 
-    async refreshContext() {
+    async refreshContext({ rotateProxy = false } = {}) {
         if (this.context) await this.context.close().catch(() => {});
         if (this.browser) await this.browser.close().catch(() => {});
         this.context = null;
         this.browser = null;
+        if (rotateProxy) this.rotateProxySession();
         await this.init();
     }
 
@@ -376,7 +399,11 @@ class BrowserFallback {
                 lastError = error;
                 await page.close().catch(() => {});
                 if (attempt < retries) {
-                    await this.refreshContext();
+                    const rotateProxy = isProxyConnectionError(error);
+                    if (rotateProxy) {
+                        log.warning(`Browser fallback rotating proxy session after network/proxy failure: ${error.message}`);
+                    }
+                    await this.refreshContext({ rotateProxy });
                     await randomDelay(500, 1200);
                 }
             }
@@ -398,15 +425,21 @@ function createPageFetcher(proxyConfig) {
     const userAgent = getRandomUserAgent();
     const cookieJar = new CookieJar();
     const browserFallback = new BrowserFallback(proxyConfig, sessionId, userAgent);
-    let proxyUrlPromise = null;
+    let proxySessionNonce = 0;
+    let warmedUpSessionId = null;
     let warmedUp = false;
+
+    const getSessionId = () => `${sessionId}_${proxySessionNonce}`;
+
+    const rotateProxySession = () => {
+        proxySessionNonce += 1;
+        warmedUp = false;
+        warmedUpSessionId = null;
+    };
 
     const getProxyUrl = async () => {
         if (!proxyConfig) return undefined;
-        if (!proxyUrlPromise) {
-            proxyUrlPromise = proxyConfig.newUrl(sessionId);
-        }
-        return proxyUrlPromise;
+        return proxyConfig.newUrl(getSessionId());
     };
 
     const fetchViaHttp = async ({ url, referer = DOMAIN_BASE, retries = 2 }) => {
@@ -415,8 +448,9 @@ function createPageFetcher(proxyConfig) {
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
                 const proxyUrl = await getProxyUrl();
+                const currentSessionId = getSessionId();
 
-                if (!warmedUp) {
+                if (!warmedUp || warmedUpSessionId !== currentSessionId) {
                     await gotScraping.get(DOMAIN_BASE, {
                         proxyUrl,
                         cookieJar,
@@ -431,6 +465,7 @@ function createPageFetcher(proxyConfig) {
                         },
                     });
                     warmedUp = true;
+                    warmedUpSessionId = currentSessionId;
                 }
 
                 const response = await gotScraping.get(url, {
@@ -458,9 +493,16 @@ function createPageFetcher(proxyConfig) {
                 }
 
                 lastError = new Error(`HTTP fetch did not return usable payload (status=${statusCode})`);
+                if ([407, 429, 502, 503, 504].includes(statusCode)) {
+                    rotateProxySession();
+                }
                 await randomDelay(250, 700);
             } catch (error) {
                 lastError = error;
+                if (isProxyConnectionError(error)) {
+                    log.warning(`HTTP fetch rotating proxy session after network/proxy failure: ${error.message}`);
+                    rotateProxySession();
+                }
                 await randomDelay(250, 700);
             }
         }
@@ -1323,24 +1365,33 @@ Actor.main(async () => {
                 url: job.url,
             });
 
-            const fetched = await pageFetcher.fetchHtml({
-                url: job.url,
-                referer: searchUrl,
-                retries: 2,
-            });
+            try {
+                const fetched = await pageFetcher.fetchHtml({
+                    url: job.url,
+                    referer: searchUrl,
+                    retries: 2,
+                });
 
-            if (fetched.source.startsWith('http')) {
-                httpPagesUsed++;
-            } else {
-                browserPagesUsed++;
+                if (fetched.source.startsWith('http')) {
+                    httpPagesUsed++;
+                } else {
+                    browserPagesUsed++;
+                }
+
+                const result = extractAgentsMultiTier(fetched.html, job.url, job.pageNumber);
+                return { ...job, source: fetched.source, result, error: null };
+            } catch (error) {
+                return { ...job, source: null, result: null, error: error.message };
             }
-
-            const result = extractAgentsMultiTier(fetched.html, job.url, job.pageNumber);
-            return { ...job, source: fetched.source, result };
         });
 
         for (const pageResult of pageResults.filter(Boolean).sort((left, right) => left.pageNumber - right.pageNumber)) {
             if (allAgents.length >= validatedMaxResults) break;
+
+            if (pageResult.error) {
+                log.warning(`Skipping page ${pageResult.pageNumber} due to fetch error: ${pageResult.error}`);
+                continue;
+            }
 
             if (!pageResult.result || pageResult.result.agents.length === 0) {
                 log.warning(`No agents found on page ${pageResult.pageNumber}, skipping`, {

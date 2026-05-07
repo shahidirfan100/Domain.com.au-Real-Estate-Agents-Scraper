@@ -62,20 +62,18 @@
     "maxResults": {
       "title": "Maximum Agents",
       "type": "integer",
-      "description": "Maximum number of agent profiles to collect (1-1000).",
-      "minimum": 1,
-      "maximum": 1000,
+      "description": "Maximum number of agent profiles to collect.",
       "default": 20,
+      "prefill": 20,
       "editor": "number"
     },
     "maxPages": {
       "title": "Maximum Pages",
       "type": "integer",
       "description": "Maximum number of result pages to process (each page typically contains 20-30 agents).",
-      "minimum": 1,
-      "maximum": 50,
       "editor": "number",
-      "default": 3
+      "default": 3,
+      "prefill": 3
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",

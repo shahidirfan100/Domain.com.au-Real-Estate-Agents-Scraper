@@ -43,10 +43,12 @@ const USER_AGENTS = [
 // Timings
 const PLAYWRIGHT_NAVIGATION_TIMEOUT_MS = 60000;
 const HTTP_REQUEST_TIMEOUT_MS = 30000;
+const PLAYWRIGHT_RELOAD_TIMEOUT_MS = 25000;
 const DEFAULT_PAGE_SIZE = 15;
 const MAX_CARD_PARSE = 160;
 const DATASET_BATCH_SIZE = 10;
 const PAGE_FETCH_CONCURRENCY = 3;
+const FIRST_PAGE_FETCH_ATTEMPTS = 2;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -108,6 +110,14 @@ const isProxyConnectionError = (error) => {
         || message.includes('tunneling socket could not be established')
         || message.includes('connect econnrefused')
         || (message.includes('proxy') && message.includes('refused'));
+};
+
+const isNavigationAbortError = (error) => {
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes('ns_error_abort')
+        || message.includes('ns_binding_aborted')
+        || message.includes('err_aborted')
+        || message.includes('frame was detached');
 };
 
 const cleanText = (text) => {
@@ -214,6 +224,15 @@ const isAkamaiChallengePage = (body) => {
         || body.includes('Powered and protected by Akamai')
         || body.includes('progress-btn-disabled');
     return hasChallengeMarkers && !body.includes('__NEXT_DATA__');
+};
+
+const isAccessDeniedPage = (body) => {
+    if (!body || typeof body !== 'string') return false;
+    const normalized = body.toLowerCase();
+    return normalized.includes('<title>access denied</title>')
+        || normalized.includes("you don't have permission to access")
+        || normalized.includes('https://errors.edgesuite.net/')
+        || normalized.includes('reference #18.');
 };
 
 const compactRecord = (value) => {
@@ -333,12 +352,6 @@ class BrowserFallback {
             const page = await this.context.newPage();
 
             try {
-                await page.goto(DOMAIN_BASE, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
-                }).catch(() => {});
-                await randomDelay(400, 900);
-
                 const response = await page.goto(url, {
                     waitUntil: 'domcontentloaded',
                     timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
@@ -361,12 +374,27 @@ class BrowserFallback {
                 const title = await page.title().catch(() => '');
                 const hasStructuredPayload = html.includes('__NEXT_DATA__') || html.includes('ContactSearchContact:');
                 const hasAgentLinks = html.includes('/real-estate-agent/');
+                const accessDenied = isAccessDeniedPage(html);
+
+                if (accessDenied) {
+                    await Actor.setValue('DEBUG_LAST_FETCH_FAILURE', {
+                        url,
+                        referer,
+                        attempt,
+                        statusCode,
+                        title,
+                        hasStructuredPayload,
+                        hasAgentLinks,
+                        htmlSnippet: html.slice(0, 4000),
+                    });
+                    throw new Error(`Browser blocked by access denied page (status=${statusCode})`);
+                }
 
                 if (statusCode >= 400 || isAkamaiChallengePage(html) || (!hasStructuredPayload && !hasAgentLinks)) {
                     await randomDelay(2000, 3500);
                     await page.reload({
                         waitUntil: 'domcontentloaded',
-                        timeout: PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
+                        timeout: PLAYWRIGHT_RELOAD_TIMEOUT_MS,
                     }).catch(() => {});
                     await waitForPayload();
 
@@ -374,7 +402,7 @@ class BrowserFallback {
                     const retryTitle = await page.title().catch(() => title);
                     const hasRetryPayload = retryHtml.includes('__NEXT_DATA__') || retryHtml.includes('ContactSearchContact:');
                     const hasRetryAgentLinks = retryHtml.includes('/real-estate-agent/');
-                    if (!isAkamaiChallengePage(retryHtml) && (hasRetryPayload || hasRetryAgentLinks)) {
+                    if (!isAkamaiChallengePage(retryHtml) && !isAccessDeniedPage(retryHtml) && (hasRetryPayload || hasRetryAgentLinks)) {
                         await page.close().catch(() => {});
                         return { html: retryHtml, statusCode, source: 'playwright-firefox-reload' };
                     }
@@ -399,7 +427,7 @@ class BrowserFallback {
                 lastError = error;
                 await page.close().catch(() => {});
                 if (attempt < retries) {
-                    const rotateProxy = isProxyConnectionError(error);
+                    const rotateProxy = isProxyConnectionError(error) || isNavigationAbortError(error);
                     if (rotateProxy) {
                         log.warning(`Browser fallback rotating proxy session after network/proxy failure: ${error.message}`);
                     }
@@ -487,13 +515,14 @@ function createPageFetcher(proxyConfig) {
                 const statusCode = response.statusCode || 0;
                 const hasStructuredPayload = html.includes('__NEXT_DATA__') || html.includes('ContactSearchContact:');
                 const hasAgentLinks = html.includes('/real-estate-agent/');
+                const accessDenied = isAccessDeniedPage(html);
 
-                if (statusCode < 400 && !isAkamaiChallengePage(html) && (hasStructuredPayload || hasAgentLinks)) {
+                if (statusCode < 400 && !isAkamaiChallengePage(html) && !accessDenied && (hasStructuredPayload || hasAgentLinks)) {
                     return { html, statusCode, source: 'http-got' };
                 }
 
                 lastError = new Error(`HTTP fetch did not return usable payload (status=${statusCode})`);
-                if ([407, 429, 502, 503, 504].includes(statusCode)) {
+                if ([403, 407, 429, 502, 503, 504].includes(statusCode) || accessDenied || isAkamaiChallengePage(html)) {
                     rotateProxySession();
                 }
                 await randomDelay(250, 700);
@@ -1229,6 +1258,52 @@ const buildSearchUrl = ({ startUrl, state, specialization, startUrlProvided }) =
     return parsed.toString();
 };
 
+const getFetchCandidates = (url) => {
+    const candidates = [url];
+    try {
+        const parsed = new URL(url);
+        const hasPageParam = parsed.searchParams.has('page') || parsed.searchParams.has('pageSize');
+        if (hasPageParam) {
+            parsed.searchParams.delete('page');
+            parsed.searchParams.delete('pageSize');
+            candidates.push(parsed.toString());
+        }
+    } catch {
+        // Ignore malformed URL fallback generation
+    }
+
+    return [...new Set(candidates)];
+};
+
+const fetchFirstPageWithRecovery = async ({ pageFetcher, searchUrl }) => {
+    const candidates = getFetchCandidates(searchUrl);
+    const attempts = [];
+
+    for (let attempt = 1; attempt <= FIRST_PAGE_FETCH_ATTEMPTS; attempt++) {
+        for (const candidateUrl of candidates) {
+            try {
+                const fetched = await pageFetcher.fetchHtml({
+                    url: candidateUrl,
+                    referer: DOMAIN_BASE,
+                    retries: 2,
+                });
+                return { fetched, resolvedUrl: candidateUrl, attempts };
+            } catch (error) {
+                const message = error?.message || String(error);
+                attempts.push({ attempt, url: candidateUrl, error: message });
+                log.warning(`First-page fetch attempt ${attempt} failed for ${candidateUrl}: ${message}`);
+                await randomDelay(250, 700);
+            }
+        }
+    }
+
+    const errorSummary = attempts
+        .slice(-4)
+        .map((item) => `attempt ${item.attempt} ${item.url} -> ${item.error}`)
+        .join(' | ');
+    throw new Error(`Unable to fetch first page after ${attempts.length} attempts. Last errors: ${errorSummary}`);
+};
+
 // ============================================================================
 // MAIN ACTOR LOGIC
 // ============================================================================
@@ -1316,11 +1391,16 @@ Actor.main(async () => {
             url: searchUrl,
         });
 
-        const firstFetch = await pageFetcher.fetchHtml({
-            url: searchUrl,
-            referer: DOMAIN_BASE,
-            retries: 2,
-        });
+        const firstPage = await fetchFirstPageWithRecovery({ pageFetcher, searchUrl });
+        const firstFetch = firstPage.fetched;
+        if (firstPage.resolvedUrl !== searchUrl) {
+            log.info('Using auto-healed first-page URL variant', {
+                originalUrl: searchUrl,
+                resolvedUrl: firstPage.resolvedUrl,
+            });
+            searchUrl = firstPage.resolvedUrl;
+        }
+
         if (firstFetch.source.startsWith('http')) {
             httpPagesUsed++;
         } else {

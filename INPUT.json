@@ -6,7 +6,6 @@
     "useApifyProxy": true,
     "apifyProxyGroups": [
       "RESIDENTIAL"
-    ],
-    "apifyProxyCountry": "AU"
+    ]
   }
 }
